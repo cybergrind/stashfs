@@ -6,16 +6,20 @@ authors = [{ name = 'github.com/cybergrind' }]
 license = { text = 'Apache-2.0' }
 requires-python = '>=3.13'
 dependencies = [
+  'argon2-cffi>=23.1.0',
+  'cryptography>=42',
   'fuse-python==1.0.8',
   'pytest==8.2.2',
 ]
 
 # installed with: uv sync
 [dependency-groups]
-dev = ['ruff', 'pre-commit>=4.5.1', 'uv>=0.11.1']
+dev = ['pre-commit>=4.5.1', 'pyrefly>=0.59', 'ruff', 'uv>=0.11.1']
 
 [tool.pyrefly]
-ignore-missing-imports = ['fuse', 'pytest']
+# fuse-python ships no type stubs and pyrefly cannot introspect its C
+# extension. Everything else is resolvable in the project venv.
+ignore-missing-imports = ['fuse']
 
 [tool.ruff]
 line-length = 120

@@ -1,7 +1,11 @@
 """Shared pytest fixtures for the fly test suite.
 
-These fixtures keep per-test setup boilerplate small so new tests can be
-written cheaply, and every test stays well under the 1s budget from TODO.md.
+Keeps per-test setup boilerplate small so new tests can be written
+cheaply, and every test stays well under the 1s budget from TODO.md.
+
+Fly is now backed by the encrypted ``Volume`` stack, so the fixture
+supplies the test-grade ``KDFParams.fast()`` preset and a chosen
+``password`` (empty by default -> slot 0).
 """
 
 from dataclasses import dataclass
@@ -9,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from fly import FileWrapper, Fly
+from fly import KDF, FileWrapper, Fly, KDFParams
 
 
 @dataclass
@@ -21,12 +25,18 @@ class FakeArgs:
 
 
 @pytest.fixture
-def backing_file(tmp_path):
-    """A backing file seeded with a known 22-byte payload."""
+def fast_kdf() -> KDF:
+    """Shared ``KDF`` tuned to stay under the per-test time budget."""
+    return KDF(KDFParams.fast())
 
-    def _make(name: str = 'backing', content: bytes = b'this_is_sample_content') -> Path:
+
+@pytest.fixture
+def backing_file(tmp_path):
+    """Return a factory that creates an empty backing file for a container."""
+
+    def _make(name: str = 'backing') -> Path:
         path = tmp_path / name
-        path.write_bytes(content)
+        path.write_bytes(b'')
         return path
 
     return _make
@@ -34,26 +44,37 @@ def backing_file(tmp_path):
 
 @pytest.fixture
 def file_wrapper(backing_file):
-    """A fresh FileWrapper bound to a seeded backing file."""
+    """A fresh FileWrapper bound to an empty backing file."""
     return FileWrapper(backing_file())
 
 
-@pytest.fixture
-def make_fly(backing_file):
-    """Build a Fly instance wired to a fresh backing file.
+@pytest.fixture(params=['', 'hunter2'])
+def password(request) -> str:
+    """Parametrize every test that takes ``password`` over empty + real."""
+    return request.param
 
-    Returns the Fly, and the Path of the backing file, so tests can
-    reopen the same storage (e.g. to assert persistence) via `reopen`.
+
+@pytest.fixture
+def make_fly(backing_file, fast_kdf):
+    """Build a Fly instance over a fresh encrypted container.
+
+    Returns the Fly, the backing file path, and a ``reopen`` callable that
+    remounts with the same (or a different) password so tests can assert
+    persistence.
     """
 
-    def _make(name: str = 'fly_file', content: bytes = b'this_is_sample_content'):
-        path = backing_file(name=name, content=content)
+    def _make(name: str = 'fly_file', pw: str = ''):
+        path = backing_file(name=name)
         fly = Fly()
-        fly.add_args(FakeArgs(fname=path))
+        fly.add_args(FakeArgs(fname=path), password=pw, kdf=fast_kdf)
 
-        def reopen() -> Fly:
+        def reopen(new_password: str | None = None) -> Fly:
             new_fly = Fly()
-            new_fly.add_args(FakeArgs(fname=path))
+            new_fly.add_args(
+                FakeArgs(fname=path),
+                password=pw if new_password is None else new_password,
+                kdf=fast_kdf,
+            )
             return new_fly
 
         return fly, path, reopen
@@ -62,7 +83,11 @@ def make_fly(backing_file):
 
 
 @pytest.fixture
-def fly(make_fly):
-    """A ready-to-use Fly instance for the common single-file test case."""
-    instance, _path, _reopen = make_fly()
+def fly(make_fly, password):
+    """A ready-to-use Fly for the common single-volume test case.
+
+    Parametrised over an empty password (slot 0) and a real password
+    (slot 1) so every test using this fixture runs twice.
+    """
+    instance, _path, _reopen = make_fly(pw=password)
     return instance

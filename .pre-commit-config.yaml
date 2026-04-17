@@ -30,8 +30,14 @@ repos:
         types: [python]
       - id: ruff-format
 
-  - repo: https://github.com/facebook/pyrefly-pre-commit
-    rev: 0.59.1
+  # Local hook so pyrefly runs inside the project's uv venv and can
+  # resolve project dependencies (cryptography, argon2, pytest, ...)
+  # without maintaining a parallel ignore-missing-imports list.
+  - repo: local
     hooks:
       - id: pyrefly-check
+        name: pyrefly-check
+        entry: uv run pyrefly check
+        language: system
         pass_filenames: false
+        types: [python]
