@@ -1,3 +1,7 @@
+import errno
+
+import pytest
+
 from fly import MAGIC_BYTES, FileRecord, FileStructure, FileWrapper, Fly
 
 
@@ -142,3 +146,89 @@ class TestBasicFly:
         assert fly.file_wrapper.read(8, 22) == MAGIC_BYTES
         assert fly.read('/new_file', 16, 0) == b'new_file12345678'
         assert fly.file_wrapper.read(8, file1.offset) == b'new_file'
+
+
+class TestFlyContract:
+    """Behavioral tests that lock in the contract of touched Fly methods.
+
+    These use the shared fixtures from conftest.py so adding more cases
+    stays cheap.
+    """
+
+    def test_rename_returns_enoent(self, fly):
+        """rename is currently a stub; it must return -ENOENT.
+
+        This guards against accidental regressions when the duplicate
+        definition of `rename` is removed (F811).
+        """
+        assert fly.rename('/a', '/b') == -errno.ENOENT
+
+    def test_write_swallows_plain_exception_as_eio(self, fly, monkeypatch):
+        """Plain exceptions inside write() must be mapped to -errno.EIO.
+
+        FUSE callers expect integer errno-style returns, never Python
+        exceptions, so Exception subclasses should be caught.
+        """
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError('simulated IO failure')
+
+        monkeypatch.setattr(fly.file_wrapper, 'write_end', boom)
+        assert fly.write('/new_file', b'payload', 0) == -errno.EIO
+
+    def test_write_propagates_keyboard_interrupt(self, fly, monkeypatch):
+        """KeyboardInterrupt must NOT be swallowed by write().
+
+        With a bare `except:` this test fails (red) because Ctrl+C gets
+        converted into -EIO. With `except Exception:` the signal
+        propagates, which is the behaviour we want.
+        """
+
+        def boom(*_args, **_kwargs):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(fly.file_wrapper, 'write_end', boom)
+        with pytest.raises(KeyboardInterrupt):
+            fly.write('/new_file', b'payload', 0)
+
+    def test_unlink_swallows_plain_exception_as_eio(self, fly, monkeypatch):
+        """Plain exceptions inside unlink() must be mapped to -errno.EIO."""
+        fly.write('/victim', b'data', 0)
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError('simulated IO failure')
+
+        monkeypatch.setattr(fly.file_wrapper, 'reset_handlers', boom)
+        assert fly.unlink('/victim') == -errno.EIO
+
+    def test_unlink_propagates_keyboard_interrupt(self, fly, monkeypatch):
+        """KeyboardInterrupt must NOT be swallowed by unlink().
+
+        Red with bare `except:`; green with `except Exception:`.
+        """
+        fly.write('/victim', b'data', 0)
+
+        def boom(*_args, **_kwargs):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(fly.file_wrapper, 'reset_handlers', boom)
+        with pytest.raises(KeyboardInterrupt):
+            fly.unlink('/victim')
+
+
+class TestFlyFixtures:
+    """Smoke tests that confirm the shared fixtures wire things correctly.
+
+    Keeps fixture regressions loud and obvious.
+    """
+
+    def test_make_fly_persists_across_reopen(self, make_fly):
+        fly, _path, reopen = make_fly()
+        fly.write('/persisted', b'abcdefgh', 0)
+
+        fly2 = reopen()
+        assert fly2.read('/persisted', 8, 0) == b'abcdefgh'
+
+    def test_file_wrapper_fixture_is_usable(self, file_wrapper):
+        file_wrapper.write(2, b'xy')
+        assert file_wrapper.path.read_bytes()[2:4] == b'xy'

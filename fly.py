@@ -105,8 +105,7 @@ class FileWrapper:
         """
         if offset + size > self.path.stat().st_size:
             raise ValueError('offset + size > file size')
-        temp = tempfile.NamedTemporaryFile(delete=False)
-        try:
+        with tempfile.NamedTemporaryFile() as temp:
             self.read_handle.seek(0, os.SEEK_SET)
             temp.write(self.read_handle.read(offset))
             self.read_handle.seek(offset + size, os.SEEK_SET)
@@ -115,8 +114,6 @@ class FileWrapper:
             self.path.write_bytes(temp.read())
             self.read_handle.close()
             self.read_handle = self.path.open('rb')
-        finally:
-            os.unlink(temp.name)
 
     def truncate_last(self, size):
         """
@@ -351,7 +348,7 @@ class Fly(fuse.Fuse):
             end_buffer = MAGIC_BYTES + packed_offset
             self.file_wrapper.write_end(end_buffer)
             return len(buf)
-        except:
+        except Exception:
             log.exception('write')
             return -errno.EIO
 
@@ -401,46 +398,44 @@ class Fly(fuse.Fuse):
             # if not last: copy and iteratively calculate new base
             is_first = True
             current_base = 0
-            temp = tempfile.NamedTemporaryFile(delete=False)
-            temp_handler = temp
-            read_handle = self.dst.open('rb')
+            with tempfile.NamedTemporaryFile() as temp:
+                read_handle = self.dst.open('rb')
 
-            log.debug(f'Iterate over list: {self.fs_structure.files_list}')
+                log.debug(f'Iterate over list: {self.fs_structure.files_list}')
 
-            for file_record in self.fs_structure.files_list:
-                log.debug(f'processing {file_record.name=} {file_record.size=} {file_record.offset=}')
-                if is_first:
-                    is_first = False
-                    temp_handler.write(read_handle.read(file_record.offset))
+                for file_record in self.fs_structure.files_list:
+                    log.debug(f'processing {file_record.name=} {file_record.size=} {file_record.offset=}')
+                    if is_first:
+                        is_first = False
+                        temp.write(read_handle.read(file_record.offset))
 
-                if file_record.name == path:
-                    current_base = -file_record.size
-                    continue
+                    if file_record.name == path:
+                        current_base = -file_record.size
+                        continue
 
-                read_handle.seek(file_record.offset, os.SEEK_SET)
-                temp_handler.write(read_handle.read(file_record.size))
+                    read_handle.seek(file_record.offset, os.SEEK_SET)
+                    temp.write(read_handle.read(file_record.size))
 
-                file_record.offset += current_base
+                    file_record.offset += current_base
 
-            self.fs_structure.remove(path)
-            new_meta_offset = temp_handler.tell()
-            log.debug(f'{new_meta_offset=} {self.dst.name}')
-            packed_bytes = self.fs_structure.pack()
-            temp_handler.write(struct.pack('Q', len(packed_bytes)))
-            temp_handler.write(packed_bytes)
-            temp_handler.write(MAGIC_BYTES)
-            temp_handler.write(struct.pack('Q', new_meta_offset))
-            temp_handler.flush()
-            read_handle.close()
+                self.fs_structure.remove(path)
+                new_meta_offset = temp.tell()
+                log.debug(f'{new_meta_offset=} {self.dst.name}')
+                packed_bytes = self.fs_structure.pack()
+                temp.write(struct.pack('Q', len(packed_bytes)))
+                temp.write(packed_bytes)
+                temp.write(MAGIC_BYTES)
+                temp.write(struct.pack('Q', new_meta_offset))
+                temp.flush()
+                read_handle.close()
 
-            self.file_wrapper.reset_handlers()
-            log.debug(f'{temp.name} => {self.dst}')
-            log.debug(f'old: {self.dst.stat().st_size} new: {Path(temp.name).stat().st_size} {current_base=}')
-            copyfile(temp.name, self.dst)
-            os.unlink(temp.name)
+                self.file_wrapper.reset_handlers()
+                log.debug(f'{temp.name} => {self.dst}')
+                log.debug(f'old: {self.dst.stat().st_size} new: {Path(temp.name).stat().st_size} {current_base=}')
+                copyfile(temp.name, self.dst)
 
             return 0
-        except:
+        except Exception:
             log.exception('unlink')
             return -errno.EIO
 
@@ -458,11 +453,6 @@ class Fly(fuse.Fuse):
     # change owner
     def chown(self, path, uid, gid):
         return 0
-
-    def rename(self, old, new):
-        self._ctime = time.time()
-        log.debug(f'rename {old=} {new=}')
-        return -errno.ENOENT
 
     def utime(self, path, times):
         self._ctime = time.time()
