@@ -17,8 +17,11 @@ import multiprocessing
 import os
 import re
 import stat
+import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import fuse
 
@@ -144,8 +147,16 @@ class Fly(fuse.Fuse):
 
     def rename(self, old: str, new: str) -> int:
         self._ctime = time.time()
-        log.debug(f'rename {old=} {new=}')
-        return -errno.ENOENT
+        old_name = old[1:]
+        new_name = new[1:]
+        if not self.volume.exists(old_name):
+            return -errno.ENOENT
+        try:
+            self.volume.rename(old_name, new_name)
+            return 0
+        except Exception:
+            log.exception('rename')
+            return -errno.EIO
 
     def create(self, path: str, flags: int, mode: int) -> int:
         self._ctime = time.time()
@@ -224,12 +235,22 @@ class Fly(fuse.Fuse):
 
     def utime(self, path: str, times) -> int:
         self._ctime = time.time()
-        log.debug(f'utime {path=} {times=}')
+        if path != '/' and not self.volume.exists(path[1:]):
+            return -errno.ENOENT
         return 0
 
-    def utimens(self, path: str, times=None) -> int:
+    def utimens(self, path: str, ts_acc, ts_mod) -> int:
+        """Update access / modification times.
+
+        fuse-python 1.0.8 invokes this as ``utimens(path, ts_acc, ts_mod)``
+        where each ts is a ``fuse.Timespec``. We don't persist times per
+        file today, so this is effectively a no-op, but accepting the
+        correct signature is what lets ``touch`` succeed (otherwise the
+        arity mismatch surfaces as ``EINVAL`` to userspace).
+        """
         self._ctime = time.time()
-        log.debug(f'utimens {path=} {times=}')
+        if path != '/' and not self.volume.exists(path[1:]):
+            return -errno.ENOENT
         return 0
 
 
@@ -267,6 +288,51 @@ def _ensure_mountpoint(mountpoint: Path) -> None:
     log.info('created mountpoint %s', mountpoint)
 
 
+def _looks_like_fuse_mount(mountpoint: Path, mounts_path: str = '/proc/mounts') -> bool:
+    """True iff ``/proc/mounts`` advertises ``mountpoint`` as a FUSE mount.
+
+    We deliberately parse ``/proc/mounts`` rather than calling
+    ``os.path.ismount`` or ``stat`` on the path itself: a FUSE daemon
+    that died without cleanup leaves the kernel mount in place, and any
+    syscall that has to talk to the (gone) daemon will hang or return
+    ``ENOTCONN``. Reading ``/proc/mounts`` only touches kernel state so
+    it is safe even for a broken mount.
+    """
+    target = str(mountpoint)
+    try:
+        with open(mounts_path, encoding='utf-8') as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 3 and parts[1] == target and parts[2].startswith('fuse'):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def _unmount_stale(
+    mountpoint: Path,
+    runner: Callable[..., Any] = subprocess.run,
+) -> None:
+    """Best-effort cleanup of a leftover FUSE mount at ``mountpoint``.
+
+    If a previous run crashed or was killed, the kernel keeps the FUSE
+    mount point around and subsequent mounts fail with
+    ``mountpoint is not empty``. Detect that case via ``/proc/mounts``
+    and run ``fusermount -u`` to free the path before re-mounting.
+    Failures in the cleanup are logged and swallowed - we'd rather
+    surface the *original* FUSE error downstream than obscure it with a
+    misleading cleanup failure.
+    """
+    if not _looks_like_fuse_mount(mountpoint):
+        return
+    log.info('mountpoint %s appears to be a stale FUSE mount; unmounting', mountpoint)
+    try:
+        runner(['fusermount', '-u', str(mountpoint)], check=False, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        log.warning('failed to clean up stale mount at %s: %s', mountpoint, exc)
+
+
 def main() -> None:
     args = parse_args()
     _configure_logging(args.debug)
@@ -275,6 +341,7 @@ def main() -> None:
         log.error('File %s does not exist', args.fname)
         raise SystemExit(1)
 
+    _unmount_stale(args.mountpoint)
     _ensure_mountpoint(args.mountpoint)
 
     # Always prompt. An empty string is a real, valid password bound to

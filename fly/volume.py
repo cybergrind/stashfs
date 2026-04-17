@@ -12,6 +12,7 @@ glue in ``fuse_app``) serialise calls through a single-process handler.
 from __future__ import annotations
 
 import os
+import struct
 
 from fly.container import CHUNK_PAYLOAD_SIZE, Container
 from fly.crypto import KDF, AEADChunk
@@ -21,6 +22,22 @@ from fly.slot_table import SlotInfo, SlotTable
 
 class VolumeCorrupt(Exception):
     """Raised when a chunk we expected to decrypt failed authentication."""
+
+
+# File-index chunk plaintext layout (v1)::
+#
+#     [ 8 B magic = INDEX_MAGIC ][ 8 B next_chunk_id u64 BE ][ payload ]
+#
+# The magic disambiguates the new versioned format from legacy containers
+# that stored the index as a plain zero-padded serialised blob in a
+# single chunk (no header, no chain pointer). When ``_read_index_chain``
+# sees a chunk that does not begin with the magic it falls back to the
+# legacy reader and treats the whole 4096-byte plaintext as a one-shot
+# payload. ``INDEX_CHAIN_END`` marks the last chunk in a chain.
+INDEX_MAGIC = b'FIDXv001'
+INDEX_HEADER_SIZE = len(INDEX_MAGIC) + 8
+INDEX_PAYLOAD_SIZE = CHUNK_PAYLOAD_SIZE - INDEX_HEADER_SIZE
+INDEX_CHAIN_END = 0xFFFF_FFFF_FFFF_FFFF
 
 
 class Volume:
@@ -152,6 +169,25 @@ class Volume:
         file.size = size
         self._persist_file_index()
 
+    def rename(self, old: str, new: str) -> None:
+        """Rename ``old`` to ``new`` within this volume.
+
+        Overwrites ``new`` if it already exists. Renaming to the same
+        name is a no-op. Raises ``KeyError`` if ``old`` does not exist.
+        The move is pure metadata: we just re-key the entry in the file
+        index and rewrite the index chunk. Data chunks stay where they
+        are.
+        """
+        if old == new:
+            if old not in self._files:
+                raise KeyError(old)
+            return
+        if old not in self._files:
+            raise KeyError(old)
+        entry = self._files.pop(old)
+        self._files[new] = VolumeFile(name=new, size=entry.size, chunk_ids=entry.chunk_ids)
+        self._persist_file_index()
+
     def unlink(self, name: str) -> None:
         if name not in self._files:
             raise KeyError(name)
@@ -174,15 +210,40 @@ class Volume:
 
     def _load_file_index(self) -> None:
         assert self._slot.file_table_chunk_id is not None
-        plaintext = self._decrypt_chunk(self._slot.file_table_chunk_id)
-        self._files = parse(plaintext)
+        blob = self._read_index_chain(self._slot.file_table_chunk_id)
+        self._files = parse(blob)
+
+    def _read_index_chain(self, head_chunk_id: int) -> bytes:
+        """Walk the ``next``-pointer chain starting at ``head_chunk_id``.
+
+        Auto-detects the legacy single-chunk index format: a chunk whose
+        plaintext does *not* start with ``INDEX_MAGIC`` is treated as a
+        zero-padded serialised blob with no chain pointer. This lets
+        containers written before the chained-index change still open.
+        """
+        out = bytearray()
+        cid = head_chunk_id
+        seen: set[int] = set()
+        while cid != INDEX_CHAIN_END:
+            if cid in seen:
+                raise VolumeCorrupt(f'file index chain cycle at chunk {cid}')
+            seen.add(cid)
+            plaintext = self._decrypt_chunk(cid)
+            if plaintext[: len(INDEX_MAGIC)] == INDEX_MAGIC:
+                (next_cid,) = struct.unpack('>Q', plaintext[len(INDEX_MAGIC) : INDEX_HEADER_SIZE])
+                payload = plaintext[INDEX_HEADER_SIZE:]
+                out.extend(payload)
+                cid = next_cid
+            else:
+                # Legacy v0: whole plaintext is the serialised blob
+                # (zero-padded). No chain, stop after this chunk.
+                out.extend(plaintext)
+                break
+        return bytes(out)
 
     def _persist_file_index(self) -> None:
         blob = serialize(self._files)
-        if len(blob) > CHUNK_PAYLOAD_SIZE:
-            raise RuntimeError(f'file index too large for one chunk ({len(blob)} > {CHUNK_PAYLOAD_SIZE})')
-        padded = blob + b'\x00' * (CHUNK_PAYLOAD_SIZE - len(blob))
-        new_chunk_id = self._append_plaintext(padded)
+        new_chunk_id = self._write_index_chain(blob)
         if self._slot.file_table_chunk_id is None:
             slot_index = self._reserve_slot_for_associate()
             self.slot_table.associate(slot_index, self._slot.volume_key, new_chunk_id)
@@ -200,6 +261,29 @@ class Volume:
                 file_table_chunk_id=new_chunk_id,
                 is_new=False,
             )
+
+    def _write_index_chain(self, blob: bytes) -> int:
+        """Append the serialised index as a chain of versioned chunks.
+
+        Each chunk's plaintext is
+        ``INDEX_MAGIC || next_cid || page || zero_pad`` to the full
+        chunk payload size. Pages are appended in reverse so every
+        non-tail chunk already knows its successor's id by the time it
+        is sealed. Returns the *head* chunk id (what the slot should
+        point at).
+        """
+        if blob == b'':
+            pages: list[bytes] = [b'']
+        else:
+            pages = [blob[i : i + INDEX_PAYLOAD_SIZE] for i in range(0, len(blob), INDEX_PAYLOAD_SIZE)]
+        next_cid = INDEX_CHAIN_END
+        for page in reversed(pages):
+            padded_page = page + b'\x00' * (INDEX_PAYLOAD_SIZE - len(page))
+            assert len(padded_page) == INDEX_PAYLOAD_SIZE
+            plaintext = INDEX_MAGIC + struct.pack('>Q', next_cid) + padded_page
+            assert len(plaintext) == CHUNK_PAYLOAD_SIZE
+            next_cid = self._append_plaintext(plaintext)
+        return next_cid
 
     def _reserve_slot_for_associate(self) -> int:
         """Return the slot index to associate on the first commit.

@@ -11,7 +11,7 @@ import errno
 import pytest
 
 from fly import KDF, FileRecord, FileStructure, FileWrapper, Fly, KDFParams
-from fly.fuse_app import _ensure_mountpoint
+from fly.fuse_app import _ensure_mountpoint, _looks_like_fuse_mount, _unmount_stale
 from fly.volume import Volume
 from tests.conftest import FakeArgs
 
@@ -218,11 +218,33 @@ class TestCoverFile:
         assert path.read_bytes()[: len(cover)] == cover
 
 
+class TestRename:
+    """FUSE-level rename contract (``mv src dst``)."""
+
+    def test_rename_moves_file(self, fly):
+        fly.write('/old', b'payload', 0)
+        assert fly.rename('/old', '/new') == 0
+        assert fly.read('/new', 100, 0) == b'payload'
+        assert fly.read('/old', 100, 0) == -errno.ENOENT
+
+    def test_rename_missing_source_returns_enoent(self, fly):
+        assert fly.rename('/nope', '/dst') == -errno.ENOENT
+
+    def test_rename_overwrites_existing_destination(self, fly):
+        fly.write('/src', b'SRC', 0)
+        fly.write('/dst', b'DST-old-content', 0)
+        assert fly.rename('/src', '/dst') == 0
+        assert fly.read('/dst', 100, 0) == b'SRC'
+        assert fly.read('/src', 100, 0) == -errno.ENOENT
+
+    def test_rename_to_self_is_noop(self, fly):
+        fly.write('/same', b'x', 0)
+        assert fly.rename('/same', '/same') == 0
+        assert fly.read('/same', 1, 0) == b'x'
+
+
 class TestFlyContract:
     """Behavioral tests that lock in the contract of touched Fly methods."""
-
-    def test_rename_returns_enoent(self, fly):
-        assert fly.rename('/a', '/b') == -errno.ENOENT
 
     def test_write_swallows_plain_exception_as_eio(self, fly, monkeypatch):
         def boom(*_args, **_kwargs):
@@ -285,6 +307,33 @@ class TestFlyFixtures:
         assert fly.kdf.params == KDFParams.fast()
 
 
+class TestTouchSemantics:
+    """``touch /mnt/foo`` does mknod(O_CREAT) + utimensat on the new path.
+
+    fuse-python 1.0.8 dispatches utimensat as ``utimens(path, ts_acc, ts_mod)``
+    - three positional args after self - so our handler must accept that
+    shape and return 0 (we don't currently persist times per file, but
+    the op must not crash).
+    """
+
+    def test_utimens_accepts_two_timespecs(self, fly):
+        fly.write('/existing', b'x', 0)
+        # Sentinels stand in for fuse.Timespec - we ignore the values.
+        assert fly.utimens('/existing', object(), object()) == 0
+
+    def test_utimens_on_missing_returns_enoent(self, fly):
+        assert fly.utimens('/nope', object(), object()) == -errno.ENOENT
+
+    def test_utimens_on_root_is_noop(self, fly):
+        assert fly.utimens('/', object(), object()) == 0
+
+    def test_touch_like_sequence_succeeds(self, fly):
+        # mknod (like open O_CREAT) then utimensat.
+        assert fly.mknod('/fresh', 0o644, 0) == 0
+        assert fly.utimens('/fresh', object(), object()) == 0
+        assert fly.getattr('/fresh').st_size == 0
+
+
 class TestEnsureMountpoint:
     """``main()`` shouldn't force users to ``mkdir /tmp/aaa`` first."""
 
@@ -311,3 +360,97 @@ class TestEnsureMountpoint:
         target.write_text('i am a file')
         with pytest.raises(NotADirectoryError):
             _ensure_mountpoint(target)
+
+
+class TestLooksLikeFuseMount:
+    """Detect stale FUSE mounts by reading /proc/mounts.
+
+    We avoid stat-ing the mountpoint itself because a stale FUSE mount
+    whose daemon died can make stat hang or error out.
+    """
+
+    def _make_mounts(self, tmp_path, lines):
+        mounts = tmp_path / 'mounts'
+        mounts.write_text(''.join(line + '\n' for line in lines))
+        return mounts
+
+    def test_returns_true_for_fuse_mount(self, tmp_path):
+        mp = tmp_path / 'mnt'
+        mp.mkdir()
+        mounts = self._make_mounts(
+            tmp_path,
+            [f'fly.py {mp} fuse.fly.py rw,nosuid,nodev 0 0'],
+        )
+        assert _looks_like_fuse_mount(mp, mounts_path=str(mounts)) is True
+
+    def test_returns_false_for_regular_directory(self, tmp_path):
+        mp = tmp_path / 'mnt'
+        mp.mkdir()
+        mounts = self._make_mounts(
+            tmp_path,
+            ['/dev/sda1 / ext4 rw 0 0'],
+        )
+        assert _looks_like_fuse_mount(mp, mounts_path=str(mounts)) is False
+
+    def test_returns_false_for_non_fuse_mount_at_same_path(self, tmp_path):
+        mp = tmp_path / 'mnt'
+        mp.mkdir()
+        mounts = self._make_mounts(
+            tmp_path,
+            [f'tmpfs {mp} tmpfs rw 0 0'],
+        )
+        assert _looks_like_fuse_mount(mp, mounts_path=str(mounts)) is False
+
+    def test_returns_false_when_mounts_missing(self, tmp_path):
+        mp = tmp_path / 'mnt'
+        mp.mkdir()
+        assert _looks_like_fuse_mount(mp, mounts_path=str(tmp_path / 'nope')) is False
+
+
+class TestUnmountStale:
+    """``_unmount_stale`` should transparently clean up a leftover FUSE
+    mount so the user doesn't have to run ``fusermount -u`` by hand
+    after every crash.
+    """
+
+    def test_no_op_when_path_is_not_a_mount(self, tmp_path, monkeypatch):
+        calls = []
+
+        def fake_runner(argv, **kw):
+            calls.append(argv)
+
+            class R:
+                returncode = 0
+
+            return R()
+
+        monkeypatch.setattr('fly.fuse_app._looks_like_fuse_mount', lambda *_a, **_k: False)
+        _unmount_stale(tmp_path / 'mnt', runner=fake_runner)
+        assert calls == []
+
+    def test_runs_fusermount_when_mounted(self, tmp_path, monkeypatch):
+        mp = tmp_path / 'mnt'
+        mp.mkdir()
+
+        calls = []
+
+        def fake_runner(argv, **kw):
+            calls.append(argv)
+
+            class R:
+                returncode = 0
+
+            return R()
+
+        monkeypatch.setattr('fly.fuse_app._looks_like_fuse_mount', lambda *_a, **_k: True)
+        _unmount_stale(mp, runner=fake_runner)
+        assert calls == [['fusermount', '-u', str(mp)]]
+
+    def test_swallows_runner_failure(self, tmp_path, monkeypatch):
+        def fake_runner(argv, **kw):
+            raise FileNotFoundError('fusermount not installed')
+
+        monkeypatch.setattr('fly.fuse_app._looks_like_fuse_mount', lambda *_a, **_k: True)
+        # Must not raise - we prefer to surface the original FUSE error
+        # downstream rather than a cleanup failure.
+        _unmount_stale(tmp_path / 'mnt', runner=fake_runner)

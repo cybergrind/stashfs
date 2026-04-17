@@ -129,6 +129,147 @@ class TestUnlink:
         assert gamma.slot_index == alpha_slot
 
 
+class TestLegacyIndexChunkCompat:
+    """Containers written before the chained-index change stored the file
+    index as a plain, zero-padded serialised blob inside a single chunk.
+    Opening such a container with the new code must still work; the
+    chain pointer is simply absent there.
+    """
+
+    def _legacy_index_chunk(self, v: Volume, files: dict) -> int:
+        """Append one legacy-format index chunk and return its id.
+
+        Legacy layout: ``serialize(files) + zero_padding`` inside the
+        4096 B chunk payload. No magic, no next-pointer.
+        """
+        from fly.file_index import serialize
+
+        blob = serialize(files)
+        padded = blob + b'\x00' * (CHUNK_PAYLOAD_SIZE - len(blob))
+        return v._append_plaintext(padded)
+
+    def test_loads_legacy_index_chunk(self, container, kdf):
+        from fly.file_index import VolumeFile
+
+        # First write a real data chunk so chunk ids > 0 exist.
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('seed', 0, b'seed-data')
+
+        # Now craft a legacy index chunk that references that data.
+        data_chunk_id = v._files['seed'].chunk_ids[0]
+        legacy_files = {
+            'seed': VolumeFile(name='seed', size=9, chunk_ids=[data_chunk_id]),
+        }
+        legacy_cid = self._legacy_index_chunk(v, legacy_files)
+        v.slot_table.update(v.slot_index, v._slot.volume_key, legacy_cid)
+
+        # A fresh Volume must find the legacy slot and decode it.
+        v2 = Volume(container, kdf, 'alpha')
+        assert v2.list() == ['seed']
+        assert v2.read_file('seed', 0, 9) == b'seed-data'
+
+    def test_legacy_index_with_large_payload(self, container, kdf):
+        """Legacy blob close to the chunk boundary - last bytes are real
+        data, not zeros. Must still parse as a single-chunk index.
+        """
+
+        v = Volume(container, kdf, 'alpha')
+        # Seed many real data chunks so chunk_ids list is long enough
+        # to push the serialised blob up towards the full chunk size.
+        v.write_file('seed', 0, b'x' * (200 * CHUNK_PAYLOAD_SIZE))
+
+        legacy_files = {'seed': v._files['seed']}
+        legacy_cid = self._legacy_index_chunk(v, legacy_files)
+        v.slot_table.update(v.slot_index, v._slot.volume_key, legacy_cid)
+
+        v2 = Volume(container, kdf, 'alpha')
+        assert 'seed' in v2.list()
+        assert v2.size_of('seed') == 200 * CHUNK_PAYLOAD_SIZE
+
+
+class TestLargeFileIndex:
+    """A single file whose chunk-id list overflows one index chunk.
+
+    Each chunk_id is 8 bytes. With 600 data chunks the serialised index
+    is well above the 4096-byte chunk payload, so the index must be
+    stored as a chain across multiple chunks. Previously this raised
+    ``RuntimeError: file index too large for one chunk`` which bubbled
+    out as ``EIO`` in the middle of ``cp``.
+    """
+
+    def test_large_file_roundtrips(self, container, kdf):
+        # ~600 chunks of pseudo-random payload. Enough to overflow any
+        # sane single-chunk index (600 * 8 > 4096).
+        payload = bytes(((i * 2654435761) & 0xFF) for i in range(600 * CHUNK_PAYLOAD_SIZE))
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('big', 0, payload)
+        # In-process read.
+        assert v.read_file('big', 0, len(payload)) == payload
+
+        # Fresh Volume on the same container must still read it.
+        v2 = Volume(container, kdf, 'alpha')
+        assert v2.size_of('big') == len(payload)
+        assert v2.read_file('big', 0, len(payload)) == payload
+
+    def test_growing_many_small_files_fits(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        # Many small files - stresses the index breadth rather than depth.
+        for i in range(300):
+            v.write_file(f'f_{i:04d}.bin', 0, f'payload-{i}'.encode() * 100)
+
+        v2 = Volume(container, kdf, 'alpha')
+        assert len(v2.list()) == 300
+        assert v2.read_file('f_0000.bin', 0, 9) == b'payload-0'
+
+    def test_cp_pattern_after_unlinking_all(self, container, kdf):
+        """mount -> write -> unlink -> write large file. Used to raise EIO."""
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('scratch.txt', 0, b'hi')
+        v.unlink('scratch.txt')
+
+        big = b'X' * (600 * CHUNK_PAYLOAD_SIZE)
+        v.write_file('cover.png', 0, big)
+        assert v.read_file('cover.png', 0, len(big)) == big
+
+
+class TestRename:
+    def test_rename_moves_entry(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('old', 0, b'payload')
+        v.rename('old', 'new')
+        assert v.list() == ['new']
+        assert v.read_file('new', 0, 100) == b'payload'
+
+    def test_rename_preserves_data_across_reopen(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('old', 0, b'payload')
+        v.rename('old', 'new')
+
+        v2 = Volume(container, kdf, 'alpha')
+        assert v2.list() == ['new']
+        assert v2.read_file('new', 0, 100) == b'payload'
+
+    def test_rename_to_self_is_noop(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('same', 0, b'x')
+        v.rename('same', 'same')
+        assert v.list() == ['same']
+        assert v.read_file('same', 0, 1) == b'x'
+
+    def test_rename_missing_raises(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        with pytest.raises(KeyError):
+            v.rename('missing', 'dst')
+
+    def test_rename_overwrites_existing_destination(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('src', 0, b'SRC')
+        v.write_file('dst', 0, b'DST-old')
+        v.rename('src', 'dst')
+        assert v.list() == ['dst']
+        assert v.read_file('dst', 0, 100) == b'SRC'
+
+
 class TestTruncate:
     def test_truncate_to_zero(self, container, kdf):
         v = Volume(container, kdf, 'alpha')
