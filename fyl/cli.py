@@ -1,13 +1,17 @@
-"""Unified ``fly`` command-line entry point.
+"""Unified ``fyl`` command-line entry point.
 
 Exposes two subcommands:
 
-* ``fly mount <backing> [mountpoint]`` — mount the FUSE filesystem.
-* ``fly optimize <backing>`` — rebuild the backing file, reclaiming
+* ``fyl mount <backing> [mountpoint]`` — mount the FUSE filesystem.
+* ``fyl optimize <backing>`` — rebuild the backing file, reclaiming
   space left behind by deletions, overwrites, and renames.
 
 Installed as a console script via ``[project.scripts]`` so users can
-run it as ``fly ...`` after ``uv tool install .``.
+run it as ``fyl ...`` after ``uv tool install .``.
+
+A bare path to an existing file (``fyl /path/to/backing``) is treated
+as shorthand for ``fyl mount /path/to/backing`` — mounting is the
+overwhelmingly common case and typing ``mount`` every time is friction.
 """
 
 from __future__ import annotations
@@ -53,9 +57,32 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_SUBCOMMANDS = frozenset({'mount', 'optimize'})
+
+
+def _inject_implicit_mount(argv: list[str] | None) -> list[str] | None:
+    """If the user typed ``fyl <existing-file>``, prepend ``mount``.
+
+    We only kick in when the first positional argument is neither a
+    known subcommand nor a help/option flag, and it points at an
+    existing filesystem path. Anything else falls through to argparse
+    untouched so error messages stay accurate.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        return argv
+    first = argv[0]
+    if first in _SUBCOMMANDS or first.startswith('-'):
+        return argv
+    if Path(first).exists():
+        return ['mount', *argv]
+    return argv
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(_inject_implicit_mount(argv))
     _configure_logging(getattr(args, 'debug', False))
 
     if args.command == 'mount':

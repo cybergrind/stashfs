@@ -66,7 +66,7 @@ def optimize(
     unlocked: list[_UnlockedSlot] = []
     locked: list[int] = []
     for slot_index in range(_num_slots(src_container)):
-        if not src_container.read_slot(slot_index)[0] == FLAG_OCCUPIED:
+        if src_container.read_slot(slot_index)[0] != FLAG_OCCUPIED:
             continue
         match = _try_unlock(src_container, kdf, slot_index, passwords)
         if match is None:
@@ -132,7 +132,7 @@ def _try_unlock(
         if not st.is_empty_password and slot_index == 0:
             continue
         slot_blob = container.read_slot(slot_index)
-        unwrapped = st._unwrap(slot_blob, slot_index)  # noqa: SLF001 - internal reuse
+        unwrapped = st._unwrap(slot_blob, slot_index)
         if unwrapped is None:
             continue
         volume_key, _ = unwrapped
@@ -144,7 +144,7 @@ def _try_unlock(
             index=slot_index,
             password=pw,
             volume_key=volume_key,
-            files=dict(v._files),  # noqa: SLF001 - internal reuse
+            files=dict(v._files),
         )
     return None
 

@@ -55,7 +55,6 @@ class TestOptimizeReclaimsSpace:
         got = reopened.read('/f0', len(survivor), 0)
         assert _sha(got) == _sha(survivor)
 
-
     def test_reclaims_after_in_place_overwrite(self, multi_fly, fast_kdf):
         alpha = multi_fly.mount('alpha')
         for _ in range(20):
@@ -81,7 +80,6 @@ class TestOptimizePreservesCover:
         path.write_bytes(cover)
 
         from fyl import Fly
-
         from tests.conftest import FakeArgs
 
         def mount(pw: str):
