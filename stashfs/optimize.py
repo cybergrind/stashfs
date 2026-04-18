@@ -1,4 +1,4 @@
-"""Offline compaction for fyl backing files.
+"""Offline compaction for stashfs backing files.
 
 Every mutation in ``Volume`` appends fresh chunks and orphans the old
 ones by design (crash-safe append-only). ``optimize`` rebuilds the
@@ -17,13 +17,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fyl.container import Container
-from fyl.crypto import KDF, AEADChunk
-from fyl.file_index import serialize
-from fyl.fuse_app import _looks_like_fuse_mount
-from fyl.slot_table import FLAG_OCCUPIED, SlotTable
-from fyl.storage import CoverStorage, FileWrapper
-from fyl.volume import Volume, write_index_chain
+from stashfs.container import Container
+from stashfs.crypto import KDF, AEADChunk
+from stashfs.file_index import serialize
+from stashfs.fuse_app import _looks_like_fuse_mount
+from stashfs.slot_table import FLAG_OCCUPIED, SlotTable
+from stashfs.storage import CoverStorage, FileWrapper
+from stashfs.volume import Volume, write_index_chain
 
 
 @dataclass
@@ -114,7 +114,7 @@ class _UnlockedSlot:
 
 
 def _num_slots(container: Container) -> int:
-    from fyl.container import N_SLOTS
+    from stashfs.container import N_SLOTS
 
     return N_SLOTS
 

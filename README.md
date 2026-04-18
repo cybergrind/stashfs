@@ -1,36 +1,37 @@
-# fyl
+# stashfs
 
 A tiny FUSE filesystem that stores its entire contents, encrypted, inside a
 single regular file. One backing file can host up to **8 independent
 volumes** -- one "no password" slot plus up to seven password-protected
 slots -- each with its own private file listing.
 
-(Previously named `fly`; renamed because `fly` is taken on PyPI. The
-on-disk format is unchanged.)
+(Previously named `fly`, then briefly `fyl`. The published PyPI name is
+`stashfs`; `fly` is taken on PyPI and `fyl` tripped PyPI's
+similar-name check.)
 
 ## Usage
 
 ```bash
-uv sync                                          # install dependencies
-uv run fyl mount <backing> [mountpoint] [--ttl SECONDS] [--debug]
-uv run fyl optimize <backing>                    # reclaim space
+uv sync                                              # install dependencies
+uv run stashfs mount <backing> [mountpoint] [--ttl SECONDS] [--debug]
+uv run stashfs optimize <backing>                    # reclaim space
 ```
 
-On mount `fyl` prompts for a password via `getpass`. The empty string is
-a real, stable password that always maps to slot 0; any non-empty
-password either unlocks its existing slot (slots 1..7) or grabs the
-first free slot to start a new volume. A slot only becomes "occupied"
-when the first file is written, and reverts to free when the last file
-is removed. If every password slot is occupied and the provided
-password matches none of them, the mount fails with
+On mount `stashfs` prompts for a password via `getpass`. The empty
+string is a real, stable password that always maps to slot 0; any
+non-empty password either unlocks its existing slot (slots 1..7) or
+grabs the first free slot to start a new volume. A slot only becomes
+"occupied" when the first file is written, and reverts to free when
+the last file is removed. If every password slot is occupied and the
+provided password matches none of them, the mount fails with
 `password does not match`.
 
-Unmount with `fusermount -u <mountpoint>`; `fyl` also auto-unmounts after
-`--ttl` seconds of idleness (default 300).
+Unmount with `fusermount -u <mountpoint>`; `stashfs` also auto-unmounts
+after `--ttl` seconds of idleness (default 300).
 
 Every mutation appends fresh chunks (append-only layer for crash
 safety) and never reclaims superseded ones, so the backing file
-monotonically grows. `fyl optimize` rebuilds the file with only the
+monotonically grows. `stashfs optimize` rebuilds the file with only the
 live chunks of every unlocked slot; it must not be run while the file
 is mounted.
 
@@ -48,7 +49,7 @@ is mounted.
   deliberate; it makes "pick the first free slot" easy and avoids
   VeraCrypt-grade steganography tricks.
 * **Not a production secrets store.** Compaction is available only
-  offline via `fyl optimize`; no protection against physical memory
+  offline via `stashfs optimize`; no protection against physical memory
   inspection, no multi-user keying.
 
 ## Development

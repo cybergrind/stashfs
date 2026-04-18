@@ -1,16 +1,16 @@
-"""Unified ``fyl`` command-line entry point.
+"""Unified ``stashfs`` command-line entry point.
 
 Exposes two subcommands:
 
-* ``fyl mount <backing> [mountpoint]`` — mount the FUSE filesystem.
-* ``fyl optimize <backing>`` — rebuild the backing file, reclaiming
+* ``stashfs mount <backing> [mountpoint]`` — mount the FUSE filesystem.
+* ``stashfs optimize <backing>`` — rebuild the backing file, reclaiming
   space left behind by deletions, overwrites, and renames.
 
 Installed as a console script via ``[project.scripts]`` so users can
-run it as ``fyl ...`` after ``uv tool install .``.
+run it as ``stashfs ...`` after ``uv tool install .``.
 
-A bare path to an existing file (``fyl /path/to/backing``) is treated
-as shorthand for ``fyl mount /path/to/backing`` — mounting is the
+A bare path to an existing file (``stashfs /path/to/backing``) is treated
+as shorthand for ``stashfs mount /path/to/backing`` — mounting is the
 overwhelmingly common case and typing ``mount`` every time is friction.
 """
 
@@ -22,15 +22,15 @@ import logging
 import sys
 from pathlib import Path
 
-from fyl.crypto import KDF
-from fyl.fuse_app import _configure_logging, run_mount
+from stashfs.crypto import KDF
+from stashfs.fuse_app import _configure_logging, run_mount
 
 
-log = logging.getLogger('fyl.cli')
+log = logging.getLogger('stashfs.cli')
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog='fyl', description='Encrypted single-file FUSE filesystem')
+    parser = argparse.ArgumentParser(prog='stashfs', description='Encrypted single-file FUSE filesystem')
     sub = parser.add_subparsers(dest='command', required=True)
 
     mount_p = sub.add_parser('mount', help='Mount the filesystem')
@@ -61,7 +61,7 @@ _SUBCOMMANDS = frozenset({'mount', 'optimize'})
 
 
 def _inject_implicit_mount(argv: list[str] | None) -> list[str] | None:
-    """If the user typed ``fyl <existing-file>``, prepend ``mount``.
+    """If the user typed ``stashfs <existing-file>``, prepend ``mount``.
 
     We only kick in when the first positional argument is neither a
     known subcommand nor a help/option flag, and it points at an
@@ -104,7 +104,7 @@ def _run_mount(args: argparse.Namespace) -> int:
 
 
 def _run_optimize(args: argparse.Namespace) -> int:
-    from fyl.optimize import OptimizeError, optimize
+    from stashfs.optimize import OptimizeError, optimize
 
     if not args.fname.exists():
         print(f'error: {args.fname} does not exist', file=sys.stderr)

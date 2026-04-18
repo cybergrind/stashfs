@@ -29,7 +29,7 @@ KEY_SIZE = 32
 NONCE_SIZE = 12
 TAG_SIZE = 16
 
-HKDF_INFO_PREFIX = b'fyl/slot/'
+HKDF_INFO_PREFIX = b'stashfs/slot/'
 
 
 @dataclass(frozen=True)

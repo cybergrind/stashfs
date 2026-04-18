@@ -14,10 +14,10 @@ from __future__ import annotations
 import os
 import struct
 
-from fyl.container import CHUNK_PAYLOAD_SIZE, Container
-from fyl.crypto import KDF, AEADChunk
-from fyl.file_index import VolumeFile, parse, serialize
-from fyl.slot_table import SlotInfo, SlotTable
+from stashfs.container import CHUNK_PAYLOAD_SIZE, Container
+from stashfs.crypto import KDF, AEADChunk
+from stashfs.file_index import VolumeFile, parse, serialize
+from stashfs.slot_table import SlotInfo, SlotTable
 
 
 class VolumeCorrupt(Exception):

@@ -27,8 +27,8 @@ import os
 import struct
 from dataclasses import dataclass
 
-from fyl.container import N_SLOTS, SLOT_SIZE, Container
-from fyl.crypto import KDF, KEY_SIZE, NONCE_SIZE, TAG_SIZE, AEADChunk
+from stashfs.container import N_SLOTS, SLOT_SIZE, Container
+from stashfs.crypto import KDF, KEY_SIZE, NONCE_SIZE, TAG_SIZE, AEADChunk
 
 
 FLAG_FREE = 0x00

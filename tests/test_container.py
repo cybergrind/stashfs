@@ -1,4 +1,4 @@
-"""Unit tests for ``fyl.container.Container``.
+"""Unit tests for ``stashfs.container.Container``.
 
 Container is pure byte accounting - no crypto here.
 """
@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from fyl.container import (
+from stashfs.container import (
     CHUNK_FRAME_SIZE,
     DATA_START,
     HEADER_SIZE,
@@ -17,7 +17,7 @@ from fyl.container import (
     Container,
     ContainerCorrupt,
 )
-from fyl.storage import FileWrapper
+from stashfs.storage import FileWrapper
 
 
 @pytest.fixture

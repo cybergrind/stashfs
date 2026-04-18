@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 
-log = logging.getLogger('fyl.storage')
+log = logging.getLogger('stashfs.storage')
 
 
 @runtime_checkable
@@ -49,7 +49,7 @@ class FileWrapper:
     them.
     """
 
-    MAGIC_BYTES = b'0FYLFMT0'
+    MAGIC_BYTES = b'0STSHFMT'
 
     def __init__(self, path: Path) -> None:
         self.path = path.resolve()
@@ -122,11 +122,11 @@ class FileWrapper:
 
 
 class CoverStorage:
-    """``Storage`` view that hides a fyl container inside an existing file.
+    """``Storage`` view that hides a stashfs container inside an existing file.
 
     Physical layout on the inner storage::
 
-        [cover bytes][fyl container][FOOTER_MAGIC 8B][cover_length u64 8B]
+        [cover bytes][stashfs container][FOOTER_MAGIC 8B][cover_length u64 8B]
 
     ``Container`` sits on top of this view and sees only the middle part
     as its backing, starting at offset 0. That makes cover support
@@ -139,7 +139,7 @@ class CoverStorage:
     appended after it. Existing cover bytes are never rewritten.
     """
 
-    FOOTER_MAGIC = b'FYLCOVER'
+    FOOTER_MAGIC = b'STSHCOVR'
     FOOTER_SIZE = 16
 
     def __init__(self, inner: Storage, cover_length: int) -> None:

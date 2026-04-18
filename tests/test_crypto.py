@@ -1,4 +1,4 @@
-"""Unit tests for ``fyl.crypto``.
+"""Unit tests for ``stashfs.crypto``.
 
 Argon2id parameters are dialled down to the ``fast`` preset so the whole
 crypto test module stays well under the 1-second-per-test budget.
@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-from fyl.crypto import KDF, KEY_SIZE, NONCE_SIZE, TAG_SIZE, AEADChunk, KDFParams
+from stashfs.crypto import KDF, KEY_SIZE, NONCE_SIZE, TAG_SIZE, AEADChunk, KDFParams
 
 
 @pytest.fixture

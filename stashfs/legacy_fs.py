@@ -1,7 +1,7 @@
 """Legacy byte-offset filesystem layout.
 
 This is the pre-encryption on-disk format kept intact so the existing
-tests and ``Fyl`` FUSE integration keep working during the migration.
+tests and ``Stash`` FUSE integration keep working during the migration.
 It will be replaced by the chunk-id-based ``FileIndex`` in Phase 5.
 """
 
@@ -12,9 +12,9 @@ import struct
 from dataclasses import dataclass
 
 
-log = logging.getLogger('fyl.legacy_fs')
+log = logging.getLogger('stashfs.legacy_fs')
 
-MAGIC_BYTES = b'0FYLFMT0'
+MAGIC_BYTES = b'0STSHFMT'
 
 
 @dataclass

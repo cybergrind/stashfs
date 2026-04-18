@@ -1,10 +1,10 @@
-"""Smoke tests for the unified ``fyl`` CLI."""
+"""Smoke tests for the unified ``stashfs`` CLI."""
 
 from __future__ import annotations
 
 import pytest
 
-from fyl.cli import build_parser, main
+from stashfs.cli import build_parser, main
 
 
 class TestCLIParser:
@@ -16,23 +16,23 @@ class TestCLIParser:
         assert 'mount' in captured.out
         assert 'optimize' in captured.out
 
-    def test_optimize_invocation(self, multi_fyl, fast_kdf, monkeypatch):
-        alpha = multi_fyl.mount('alpha')
+    def test_optimize_invocation(self, multi_stash, fast_kdf, monkeypatch):
+        alpha = multi_stash.mount('alpha')
         assert alpha.write('/f', b'hello', 0) == 5
-        multi_fyl.unmount_all()
+        multi_stash.unmount_all()
 
         # Use our fast KDF instead of the default production one.
-        monkeypatch.setattr('fyl.cli._build_kdf', lambda _args: fast_kdf)
+        monkeypatch.setattr('stashfs.cli._build_kdf', lambda _args: fast_kdf)
 
-        rc = main(['optimize', str(multi_fyl.path), '--password', 'alpha'])
+        rc = main(['optimize', str(multi_stash.path), '--password', 'alpha'])
         assert rc == 0
 
-        reopened = multi_fyl.mount('alpha')
+        reopened = multi_stash.mount('alpha')
         assert reopened.read('/f', 5, 0) == b'hello'
 
 
 class TestImplicitMount:
-    """`fyl <existing-file>` should behave like `fyl mount <existing-file>`.
+    """`stash <existing-file>` should behave like `stash mount <existing-file>`.
 
     A single path argument that points at an existing file is the
     overwhelmingly common case; making the user type ``mount`` every
@@ -49,7 +49,7 @@ class TestImplicitMount:
             seen['fname'] = args.fname
             seen['command'] = args.command
 
-        monkeypatch.setattr('fyl.cli._run_mount', lambda args: fake_run_mount(args) or 0)
+        monkeypatch.setattr('stashfs.cli._run_mount', lambda args: fake_run_mount(args) or 0)
 
         rc = main([str(backing)])
         assert rc == 0
@@ -69,7 +69,7 @@ class TestImplicitMount:
         backing.touch()
 
         called = {'n': 0}
-        monkeypatch.setattr('fyl.cli._run_mount', lambda args: called.update(n=called['n'] + 1) or 0)
+        monkeypatch.setattr('stashfs.cli._run_mount', lambda args: called.update(n=called['n'] + 1) or 0)
 
         rc = main(['mount', str(backing)])
         assert rc == 0

@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from fyl.storage import FileWrapper, Storage
+from stashfs.storage import FileWrapper, Storage
 
 
 HEADER_SIZE = 16

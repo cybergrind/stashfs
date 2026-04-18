@@ -1,6 +1,6 @@
 """End-to-end realistic workload across several passwords.
 
-Drives ``Fyl`` through the full set of filesystem operations a real user
+Drives ``Stash`` through the full set of filesystem operations a real user
 touches (create, write, rename/move, userland copy, remove) while three
 volumes share one backing file. At least one volume ends up with more
 than 50 files, and sizes span from zero bytes up to 200 KB, crossing the
@@ -17,8 +17,8 @@ import errno
 import hashlib
 import random
 
-from fyl import Fyl
-from fyl.container import CHUNK_PAYLOAD_SIZE
+from stashfs import Stash
+from stashfs.container import CHUNK_PAYLOAD_SIZE
 
 
 SIZES = [
@@ -47,19 +47,19 @@ def _payload(rng: random.Random, marker: bytes, size: int) -> bytes:
     return marker + rng.randbytes(size - len(marker))
 
 
-def _fs_copy(fyl: Fyl, src: str, dst: str) -> None:
-    """Userland ``cp`` over the Fyl FUSE surface: read-all + write-all."""
-    data = _read_all(fyl, src[1:])
-    assert fyl.mknod(dst, 0o644, 0) == 0
+def _fs_copy(stash: Stash, src: str, dst: str) -> None:
+    """Userland ``cp`` over the Stash FUSE surface: read-all + write-all."""
+    data = _read_all(stash, src[1:])
+    assert stash.mknod(dst, 0o644, 0) == 0
     if data:
-        assert fyl.write(dst, data, 0) == len(data)
+        assert stash.write(dst, data, 0) == len(data)
 
 
-def _read_all(fyl: Fyl, name: str) -> bytes:
-    size = fyl.volume.size_of(name)
+def _read_all(stash: Stash, name: str) -> bytes:
+    size = stash.volume.size_of(name)
     if size == 0:
         return b''
-    data = fyl.read(f'/{name}', size, 0)
+    data = stash.read(f'/{name}', size, 0)
     assert isinstance(data, bytes), f'unexpected error reading {name}: {data!r}'
     return data
 
@@ -69,18 +69,18 @@ def _sha256(data: bytes) -> str:
 
 
 class TestRealisticWorkload:
-    def test_full_workload_across_three_passwords(self, multi_fyl):
+    def test_full_workload_across_three_passwords(self, multi_stash):
         rng = random.Random(0)
 
         # Slot claims are lazy: a mount reserves an index but only
         # occupies it on the first write. Populate volumes in order so
         # each one lands on a distinct slot.
-        empty = multi_fyl.mount('')
+        empty = multi_stash.mount('')
         empty_payload = _payload(rng, b'LEAK-CHECK-EMPTY', 1234)
         assert empty.write('/public.bin', empty_payload, 0) == len(empty_payload)
         assert empty.volume.slot_index == 0
 
-        alpha = multi_fyl.mount('alpha')
+        alpha = multi_stash.mount('alpha')
 
         # --- alpha: populate >50 files with a mix of sizes -----------
         alpha_expected: dict[str, bytes] = {}
@@ -125,7 +125,7 @@ class TestRealisticWorkload:
         assert alpha.volume.slot_index == 1
 
         # --- beta-slot: a couple of files exercised through all ops -
-        beta = multi_fyl.mount('beta')
+        beta = multi_stash.mount('beta')
         big_beta = _payload(rng, b'LEAK-CHECK-BETA', 200 * 1024)
         small_beta = _payload(rng, b'LEAK-CHECK-BETA-SMALL', 17)
 
@@ -146,12 +146,12 @@ class TestRealisticWorkload:
             },
         }
 
-        # --- unmount every live Fyl, then remount each vault fresh and
+        # --- unmount every live Stash, then remount each vault fresh and
         # verify listings + checksums from a clean view of the on-disk
         # container.
-        multi_fyl.unmount_all()
+        multi_stash.unmount_all()
         for pw, want in expected.items():
-            remounted = multi_fyl.mount(pw)
+            remounted = multi_stash.mount(pw)
             assert sorted(remounted.volume.list()) == sorted(want), pw
             for name, want_hash in want.items():
                 got = _read_all(remounted, name)
@@ -161,7 +161,7 @@ class TestRealisticWorkload:
             assert foreign.isdisjoint(remounted.volume.list()), pw
 
         # --- plaintext leak check on the raw backing file -----------
-        raw = multi_fyl.path.read_bytes()
+        raw = multi_stash.path.read_bytes()
         for needle in (
             b'LEAK-CHECK-ALPHA-00',
             b'LEAK-CHECK-ALPHA-42',

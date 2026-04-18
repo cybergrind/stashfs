@@ -1,4 +1,4 @@
-"""Unit tests for ``fyl.volume.Volume``.
+"""Unit tests for ``stash.volume.Volume``.
 
 Two volumes on the same container must not interfere. The slot table
 and file index rewrites are exercised end-to-end without FUSE.
@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import pytest
 
-from fyl.container import CHUNK_PAYLOAD_SIZE, N_SLOTS, Container
-from fyl.crypto import KDF, KDFParams
-from fyl.file_index import VolumeFile, parse, serialize
-from fyl.slot_table import PasswordDoesNotMatch
-from fyl.storage import FileWrapper
-from fyl.volume import Volume
+from stashfs.container import CHUNK_PAYLOAD_SIZE, N_SLOTS, Container
+from stashfs.crypto import KDF, KDFParams
+from stashfs.file_index import VolumeFile, parse, serialize
+from stashfs.slot_table import PasswordDoesNotMatch
+from stashfs.storage import FileWrapper
+from stashfs.volume import Volume
 
 
 @pytest.fixture
@@ -142,14 +142,14 @@ class TestLegacyIndexChunkCompat:
         Legacy layout: ``serialize(files) + zero_padding`` inside the
         4096 B chunk payload. No magic, no next-pointer.
         """
-        from fyl.file_index import serialize
+        from stashfs.file_index import serialize
 
         blob = serialize(files)
         padded = blob + b'\x00' * (CHUNK_PAYLOAD_SIZE - len(blob))
         return v._append_plaintext(padded)
 
     def test_loads_legacy_index_chunk(self, container, kdf):
-        from fyl.file_index import VolumeFile
+        from stashfs.file_index import VolumeFile
 
         # First write a real data chunk so chunk ids > 0 exist.
         v = Volume(container, kdf, 'alpha')

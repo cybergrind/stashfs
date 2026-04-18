@@ -1,4 +1,4 @@
-"""Tests for ``fyl.slot_table.SlotTable``.
+"""Tests for ``stash.slot_table.SlotTable``.
 
 Covers the lifecycle rules the user called out explicitly:
 
@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import pytest
 
-from fyl.container import N_SLOTS, Container
-from fyl.crypto import KDF, KDFParams
-from fyl.slot_table import FLAG_FREE, FLAG_OCCUPIED, PasswordDoesNotMatch, SlotTable
-from fyl.storage import FileWrapper
+from stashfs.container import N_SLOTS, Container
+from stashfs.crypto import KDF, KDFParams
+from stashfs.slot_table import FLAG_FREE, FLAG_OCCUPIED, PasswordDoesNotMatch, SlotTable
+from stashfs.storage import FileWrapper
 
 
 @pytest.fixture

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from fyl.storage import CoverStorage, FileWrapper, Storage
+from stashfs.storage import CoverStorage, FileWrapper, Storage
 
 
 def _make_filewrapper(tmp_path, name='backing', content=b''):
@@ -64,8 +64,8 @@ class TestStorageContract:
 
     def test_write_at_offset_replaces_bytes(self, storage):
         storage.write_end(b'hello world')
-        storage.write(6, b'fyl!!')
-        assert storage.read(11, 0) == b'hello fyl!!'
+        storage.write(6, b'stash')
+        assert storage.read(11, 0) == b'hello stash'
 
     def test_read_past_eof_returns_short(self, storage):
         storage.write_end(b'short')

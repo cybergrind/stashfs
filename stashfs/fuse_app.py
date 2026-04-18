@@ -25,14 +25,14 @@ from typing import Any
 
 import fuse
 
-from fyl.container import Container
-from fyl.crypto import KDF
-from fyl.slot_table import PasswordDoesNotMatch
-from fyl.storage import CoverStorage, FileWrapper
-from fyl.volume import Volume
+from stashfs.container import Container
+from stashfs.crypto import KDF
+from stashfs.slot_table import PasswordDoesNotMatch
+from stashfs.storage import CoverStorage, FileWrapper
+from stashfs.volume import Volume
 
 
-log = logging.getLogger('fyl')
+log = logging.getLogger('stashfs')
 fuse.fuse_python_api = (0, 2)
 TIME_PAT = re.compile(r'.*\/\d+\.\d+')
 
@@ -43,7 +43,7 @@ if not hasattr(fuse, '__version__'):
 def _configure_logging(debug: bool) -> None:
     """Set up logging only when the app actually runs.
 
-    Doing this at import time would (a) spam /tmp/fyl.log whenever the
+    Doing this at import time would (a) spam /tmp/stashfs.log whenever the
     package is imported by a test or a library user, and (b) leak
     filenames/offsets via ``log.debug`` calls even when ``--debug`` was
     not requested. Gate everything behind an explicit call from
@@ -52,7 +52,7 @@ def _configure_logging(debug: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if debug else logging.INFO,
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-        filename='/tmp/fyl.log',
+        filename='/tmp/stashfs.log',
     )
     update_log_level(logging.DEBUG if debug else logging.INFO)
 
@@ -90,7 +90,7 @@ class MyStat(fuse.Stat):
         self.st_ctime = 0
 
 
-class Fyl(fuse.Fuse):
+class Stash(fuse.Fuse):
     def add_args(
         self,
         args,
@@ -110,7 +110,7 @@ class Fyl(fuse.Fuse):
         self.container = Container(self.cover)
         self.kdf = kdf or KDF()
         self.volume = Volume(self.container, self.kdf, password)
-        log.info(f'Fyl mounted slot {self.volume.slot_index} with {len(self.volume.list())} files')
+        log.info(f'Stash mounted slot {self.volume.slot_index} with {len(self.volume.list())} files')
 
     def getattr(self, path: str):
         if time.time() - self._ctime > self._args.ttl:
@@ -261,14 +261,14 @@ def auto_unmount(mountpoint: Path) -> None:
 
 
 def mount(args, password: str = '') -> None:
-    f = Fyl(
+    f = Stash(
         version='%prog ' + fuse.__version__,
         usage='%(prog)s [options] <mountpoint>',
         dash_s_do='setsingle',
     )
     f.add_args(args, password=password)
     f.parser.add_option(mountopt=args.mountpoint, metavar='PATH', default=args.mountpoint)
-    f.main(['fyl.py', str(args.mountpoint)])
+    f.main(['stashfs.py', str(args.mountpoint)])
 
 
 def _ensure_mountpoint(mountpoint: Path) -> None:
@@ -336,7 +336,7 @@ def _unmount_stale(
 def run_mount(args) -> None:
     """Mount ``args.fname`` at ``args.mountpoint``. Caller handles argv+logging.
 
-    Split out of ``main`` so the unified ``fyl`` CLI can call the same
+    Split out of ``main`` so the unified ``stashfs`` CLI can call the same
     post-parse flow after dispatching from its subparser.
     """
     if not args.fname.exists():
