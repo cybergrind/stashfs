@@ -90,7 +90,7 @@ class MyStat(fuse.Stat):
         self.st_ctime = 0
 
 
-class Fly(fuse.Fuse):
+class Fyl(fuse.Fuse):
     def add_args(
         self,
         args,
@@ -110,7 +110,7 @@ class Fly(fuse.Fuse):
         self.container = Container(self.cover)
         self.kdf = kdf or KDF()
         self.volume = Volume(self.container, self.kdf, password)
-        log.info(f'Fly mounted slot {self.volume.slot_index} with {len(self.volume.list())} files')
+        log.info(f'Fyl mounted slot {self.volume.slot_index} with {len(self.volume.list())} files')
 
     def getattr(self, path: str):
         if time.time() - self._ctime > self._args.ttl:
@@ -261,7 +261,7 @@ def auto_unmount(mountpoint: Path) -> None:
 
 
 def mount(args, password: str = '') -> None:
-    f = Fly(
+    f = Fyl(
         version='%prog ' + fuse.__version__,
         usage='%(prog)s [options] <mountpoint>',
         dash_s_do='setsingle',

@@ -1,6 +1,6 @@
 """Tests for the ``fyl.optimize`` compaction command.
 
-Every fly mutation leaks chunks by design (append-only layer); optimize
+Every fyl mutation leaks chunks by design (append-only layer); optimize
 is the only reclamation path. Tests drive one behaviour at a time using
 ``KDFParams.fast()`` to stay under the 1 s per-test budget.
 """
@@ -19,21 +19,21 @@ def _sha(data: bytes) -> str:
 
 
 class TestOptimizeReclaimsSpace:
-    def test_optimize_is_idempotent(self, multi_fly, fast_kdf):
+    def test_optimize_is_idempotent(self, multi_fyl, fast_kdf):
         """Running optimize on an already-compacted container reclaims nothing."""
-        alpha = multi_fly.mount('alpha')
+        alpha = multi_fyl.mount('alpha')
         assert alpha.write('/hello', b'world', 0) == 5
-        multi_fly.unmount_all()
+        multi_fyl.unmount_all()
 
-        optimize(multi_fly.path, ['alpha'], kdf=fast_kdf)
-        report = optimize(multi_fly.path, ['alpha'], kdf=fast_kdf)
+        optimize(multi_fyl.path, ['alpha'], kdf=fast_kdf)
+        report = optimize(multi_fyl.path, ['alpha'], kdf=fast_kdf)
         assert report.reclaimed == 0
 
-        reopened = multi_fly.mount('alpha')
+        reopened = multi_fyl.mount('alpha')
         assert reopened.read('/hello', 5, 0) == b'world'
 
-    def test_reclaims_orphans_after_unlink(self, multi_fly, fast_kdf):
-        alpha = multi_fly.mount('alpha')
+    def test_reclaims_orphans_after_unlink(self, multi_fyl, fast_kdf):
+        alpha = multi_fyl.mount('alpha')
         payload = b'x' * (200 * 1024)
         survivor = b'survivor' + b'y' * (200 * 1024 - len(b'survivor'))
         for i in range(5):
@@ -42,34 +42,34 @@ class TestOptimizeReclaimsSpace:
         for i in range(1, 5):
             assert alpha.unlink(f'/f{i}') == 0
 
-        multi_fly.unmount_all()
-        old_size = multi_fly.path.stat().st_size
-        report = optimize(multi_fly.path, ['alpha'], kdf=fast_kdf)
-        new_size = multi_fly.path.stat().st_size
+        multi_fyl.unmount_all()
+        old_size = multi_fyl.path.stat().st_size
+        report = optimize(multi_fyl.path, ['alpha'], kdf=fast_kdf)
+        new_size = multi_fyl.path.stat().st_size
 
         assert report.reclaimed == old_size - new_size
         assert new_size < old_size * 0.5, f'expected major reclaim, got {old_size} -> {new_size}'
 
-        reopened = multi_fly.mount('alpha')
+        reopened = multi_fyl.mount('alpha')
         assert reopened.volume.list() == ['f0']
         got = reopened.read('/f0', len(survivor), 0)
         assert _sha(got) == _sha(survivor)
 
-    def test_reclaims_after_in_place_overwrite(self, multi_fly, fast_kdf):
-        alpha = multi_fly.mount('alpha')
+    def test_reclaims_after_in_place_overwrite(self, multi_fyl, fast_kdf):
+        alpha = multi_fyl.mount('alpha')
         for _ in range(20):
             assert alpha.write('/f', b'A' * 200, 0) == 200
         final = b'Z' * 200
         assert alpha.write('/f', final, 0) == 200
-        multi_fly.unmount_all()
+        multi_fyl.unmount_all()
 
-        old = multi_fly.path.stat().st_size
-        report = optimize(multi_fly.path, ['alpha'], kdf=fast_kdf)
-        new = multi_fly.path.stat().st_size
+        old = multi_fyl.path.stat().st_size
+        report = optimize(multi_fyl.path, ['alpha'], kdf=fast_kdf)
+        new = multi_fyl.path.stat().st_size
 
         assert report.reclaimed > 0
         assert new < old
-        reopened = multi_fly.mount('alpha')
+        reopened = multi_fyl.mount('alpha')
         assert reopened.read('/f', 200, 0) == final
 
 
@@ -79,11 +79,11 @@ class TestOptimizePreservesCover:
         path = tmp_path / 'file.png'
         path.write_bytes(cover)
 
-        from fyl import Fly
+        from fyl import Fyl
         from tests.conftest import FakeArgs
 
         def mount(pw: str):
-            f = Fly()
+            f = Fyl()
             f.add_args(FakeArgs(fname=path), password=pw, kdf=fast_kdf)
             return f
 
@@ -106,20 +106,20 @@ class TestOptimizePreservesCover:
 
 
 class TestOptimizeMultiVolume:
-    def test_rebuild_across_three_passwords(self, multi_fly, fast_kdf):
-        empty = multi_fly.mount('')
+    def test_rebuild_across_three_passwords(self, multi_fyl, fast_kdf):
+        empty = multi_fyl.mount('')
         assert empty.write('/pub', b'public-bytes', 0) == 12
 
-        alpha = multi_fly.mount('alpha')
+        alpha = multi_fyl.mount('alpha')
         for i in range(4):
             assert alpha.write(f'/a{i}', bytes([i]) * 1000, 0) == 1000
         assert alpha.unlink('/a1') == 0
         assert alpha.rename('/a2', '/a2_renamed') == 0
 
-        beta = multi_fly.mount('beta')
+        beta = multi_fyl.mount('beta')
         assert beta.write('/b', b'beta-bytes' * 1000, 0) == 10_000
 
-        multi_fly.unmount_all()
+        multi_fyl.unmount_all()
 
         expected = {
             '': {'pub': _sha(b'public-bytes')},
@@ -131,14 +131,14 @@ class TestOptimizeMultiVolume:
             'beta': {'b': _sha(b'beta-bytes' * 1000)},
         }
 
-        old = multi_fly.path.stat().st_size
-        report = optimize(multi_fly.path, ['', 'alpha', 'beta'], kdf=fast_kdf)
-        new = multi_fly.path.stat().st_size
+        old = multi_fyl.path.stat().st_size
+        report = optimize(multi_fyl.path, ['', 'alpha', 'beta'], kdf=fast_kdf)
+        new = multi_fyl.path.stat().st_size
         assert report.rebuilt_slots == [0, 1, 2]
         assert new < old
 
         for pw, want in expected.items():
-            ro = multi_fly.mount(pw)
+            ro = multi_fyl.mount(pw)
             assert sorted(ro.volume.list()) == sorted(want), pw
             for name, want_hash in want.items():
                 size = ro.volume.size_of(name)
@@ -148,51 +148,51 @@ class TestOptimizeMultiVolume:
 
 
 class TestOptimizeErrors:
-    def test_refuses_locked_slot(self, multi_fly, fast_kdf):
-        alpha = multi_fly.mount('alpha')
+    def test_refuses_locked_slot(self, multi_fyl, fast_kdf):
+        alpha = multi_fyl.mount('alpha')
         assert alpha.write('/secret', b'hello', 0) == 5
-        multi_fly.unmount_all()
+        multi_fyl.unmount_all()
 
-        before = multi_fly.path.read_bytes()
+        before = multi_fyl.path.read_bytes()
         with pytest.raises(OptimizeError):
-            optimize(multi_fly.path, [''], kdf=fast_kdf)
-        assert multi_fly.path.read_bytes() == before
+            optimize(multi_fyl.path, [''], kdf=fast_kdf)
+        assert multi_fyl.path.read_bytes() == before
 
-    def test_drop_locked_purges(self, multi_fly, fast_kdf):
-        empty = multi_fly.mount('')
+    def test_drop_locked_purges(self, multi_fyl, fast_kdf):
+        empty = multi_fyl.mount('')
         assert empty.write('/pub', b'public', 0) == 6
-        alpha = multi_fly.mount('alpha')
+        alpha = multi_fyl.mount('alpha')
         assert alpha.write('/secret', b'alpha-data', 0) == 10
-        multi_fly.unmount_all()
+        multi_fyl.unmount_all()
 
-        report = optimize(multi_fly.path, [''], kdf=fast_kdf, drop_locked=True)
+        report = optimize(multi_fyl.path, [''], kdf=fast_kdf, drop_locked=True)
         assert report.dropped_slots == [1]
         assert report.rebuilt_slots == [0]
 
-        empty_ro = multi_fly.mount('')
+        empty_ro = multi_fyl.mount('')
         assert empty_ro.read('/pub', 6, 0) == b'public'
         # Slot 1 is free -> mounting "alpha" creates a fresh, empty volume.
-        alpha_ro = multi_fly.mount('alpha')
+        alpha_ro = multi_fyl.mount('alpha')
         assert alpha_ro.volume.list() == []
 
-    def test_refuses_live_mount(self, multi_fly, fast_kdf, monkeypatch):
-        alpha = multi_fly.mount('alpha')
+    def test_refuses_live_mount(self, multi_fyl, fast_kdf, monkeypatch):
+        alpha = multi_fyl.mount('alpha')
         assert alpha.write('/f', b'x', 0) == 1
-        multi_fly.unmount_all()
+        multi_fyl.unmount_all()
 
         monkeypatch.setattr('fyl.optimize._looks_like_fuse_mount', lambda *_a, **_k: True)
-        before = multi_fly.path.read_bytes()
+        before = multi_fyl.path.read_bytes()
         with pytest.raises(OptimizeError):
-            optimize(multi_fly.path, ['alpha'], kdf=fast_kdf)
-        assert multi_fly.path.read_bytes() == before
+            optimize(multi_fyl.path, ['alpha'], kdf=fast_kdf)
+        assert multi_fyl.path.read_bytes() == before
 
-    def test_atomicity_on_write_error(self, multi_fly, fast_kdf, monkeypatch):
-        alpha = multi_fly.mount('alpha')
+    def test_atomicity_on_write_error(self, multi_fyl, fast_kdf, monkeypatch):
+        alpha = multi_fyl.mount('alpha')
         for i in range(5):
             assert alpha.write(f'/f{i}', b'payload', 0) == 7
-        multi_fly.unmount_all()
+        multi_fyl.unmount_all()
 
-        before = multi_fly.path.read_bytes()
+        before = multi_fyl.path.read_bytes()
 
         from fyl import Container
 
@@ -208,7 +208,7 @@ class TestOptimizeErrors:
         monkeypatch.setattr(Container, 'append_chunk', flaky)
 
         with pytest.raises(OSError, match='simulated write error'):
-            optimize(multi_fly.path, ['alpha'], kdf=fast_kdf)
+            optimize(multi_fyl.path, ['alpha'], kdf=fast_kdf)
 
-        assert multi_fly.path.read_bytes() == before
-        assert not multi_fly.path.with_suffix(multi_fly.path.suffix + '.tmp').exists()
+        assert multi_fyl.path.read_bytes() == before
+        assert not multi_fyl.path.with_suffix(multi_fyl.path.suffix + '.tmp').exists()

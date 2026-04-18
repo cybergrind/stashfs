@@ -1,4 +1,4 @@
-"""Tests for ``fly.slot_table.SlotTable``.
+"""Tests for ``fyl.slot_table.SlotTable``.
 
 Covers the lifecycle rules the user called out explicitly:
 

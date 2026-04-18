@@ -20,7 +20,7 @@ from fyl.crypto import KDF, KEY_SIZE, NONCE_SIZE, TAG_SIZE, AEADChunk, KDFParams
 from fyl.file_index import FileIndexCorrupt, VolumeFile
 from fyl.fuse_app import (
     TIME_PAT,
-    Fly,
+    Fyl,
     MyStat,
     auto_unmount,
     call_fuse_exit,
@@ -60,7 +60,7 @@ __all__ = [
     'FileRecord',
     'FileStructure',
     'FileWrapper',
-    'Fly',
+    'Fyl',
     'KDFParams',
     'MyStat',
     'PasswordDoesNotMatch',

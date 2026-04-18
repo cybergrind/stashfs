@@ -49,7 +49,7 @@ class FileWrapper:
     them.
     """
 
-    MAGIC_BYTES = b'0FLYFMT0'
+    MAGIC_BYTES = b'0FYLFMT0'
 
     def __init__(self, path: Path) -> None:
         self.path = path.resolve()
@@ -139,7 +139,7 @@ class CoverStorage:
     appended after it. Existing cover bytes are never rewritten.
     """
 
-    FOOTER_MAGIC = b'FLYCOVER'
+    FOOTER_MAGIC = b'FYLCOVER'
     FOOTER_SIZE = 16
 
     def __init__(self, inner: Storage, cover_length: int) -> None:

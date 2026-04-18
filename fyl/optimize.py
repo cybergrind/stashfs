@@ -1,4 +1,4 @@
-"""Offline compaction for fly backing files.
+"""Offline compaction for fyl backing files.
 
 Every mutation in ``Volume`` appends fresh chunks and orphans the old
 ones by design (crash-safe append-only). ``optimize`` rebuilds the

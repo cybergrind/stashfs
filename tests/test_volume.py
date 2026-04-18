@@ -1,4 +1,4 @@
-"""Unit tests for ``fly.volume.Volume``.
+"""Unit tests for ``fyl.volume.Volume``.
 
 Two volumes on the same container must not interfere. The slot table
 and file index rewrites are exercised end-to-end without FUSE.

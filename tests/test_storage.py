@@ -64,8 +64,8 @@ class TestStorageContract:
 
     def test_write_at_offset_replaces_bytes(self, storage):
         storage.write_end(b'hello world')
-        storage.write(6, b'fly!!')
-        assert storage.read(11, 0) == b'hello fly!!'
+        storage.write(6, b'fyl!!')
+        assert storage.read(11, 0) == b'hello fyl!!'
 
     def test_read_past_eof_returns_short(self, storage):
         storage.write_end(b'short')

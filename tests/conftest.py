@@ -3,7 +3,7 @@
 Keeps per-test setup boilerplate small so new tests can be written
 cheaply, and every test stays well under the 1s budget from TODO.md.
 
-Fly is now backed by the encrypted ``Volume`` stack, so the fixture
+Fyl is now backed by the encrypted ``Volume`` stack, so the fixture
 supplies the test-grade ``KDFParams.fast()`` preset and a chosen
 ``password`` (empty by default -> slot 0).
 """
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from fyl import KDF, FileWrapper, Fly, KDFParams
+from fyl import KDF, FileWrapper, Fyl, KDFParams
 
 
 @dataclass
@@ -56,21 +56,21 @@ def password(request) -> str:
 
 
 @pytest.fixture
-def make_fly(backing_file, fast_kdf):
-    """Build a Fly instance over a fresh encrypted container.
+def make_fyl(backing_file, fast_kdf):
+    """Build a Fyl instance over a fresh encrypted container.
 
-    Returns the Fly, the backing file path, and a ``reopen`` callable that
+    Returns the Fyl, the backing file path, and a ``reopen`` callable that
     remounts with the same (or a different) password so tests can assert
     persistence.
     """
 
     def _make(name: str = 'fly_file', pw: str = ''):
         path = backing_file(name=name)
-        fly = Fly()
-        fly.add_args(FakeArgs(fname=path), password=pw, kdf=fast_kdf)
+        fyl = Fyl()
+        fyl.add_args(FakeArgs(fname=path), password=pw, kdf=fast_kdf)
 
-        def reopen(new_password: str | None = None) -> Fly:
-            new_fly = Fly()
+        def reopen(new_password: str | None = None) -> Fyl:
+            new_fly = Fyl()
             new_fly.add_args(
                 FakeArgs(fname=path),
                 password=pw if new_password is None else new_password,
@@ -78,17 +78,17 @@ def make_fly(backing_file, fast_kdf):
             )
             return new_fly
 
-        return fly, path, reopen
+        return fyl, path, reopen
 
     return _make
 
 
-class MultiFly:
+class MultiFyl:
     """Test helper for driving several passwords against one backing file.
 
-    Hides the boilerplate of constructing ``Fly`` / ``FakeArgs`` / ``KDF``
+    Hides the boilerplate of constructing ``Fyl`` / ``FakeArgs`` / ``KDF``
     and provides an honest ``unmount_all`` that actually releases the
-    Python-side file handles. Fly participates in a reference cycle
+    Python-side file handles. Fyl participates in a reference cycle
     (via ``fuse.Fuse``) so ``del`` alone does not drop the object; we
     close the ``FileWrapper`` read handle explicitly and then force
     cyclic GC so a subsequent ``mount`` opens an independent view of
@@ -98,40 +98,40 @@ class MultiFly:
     def __init__(self, path: Path, kdf: KDF) -> None:
         self.path = path
         self.kdf = kdf
-        self._live: list[Fly] = []
+        self._live: list[Fyl] = []
 
-    def mount(self, password: str = '') -> Fly:
-        fly = Fly()
-        fly.add_args(FakeArgs(fname=self.path), password=password, kdf=self.kdf)
-        self._live.append(fly)
-        return fly
+    def mount(self, password: str = '') -> Fyl:
+        fyl = Fyl()
+        fyl.add_args(FakeArgs(fname=self.path), password=password, kdf=self.kdf)
+        self._live.append(fyl)
+        return fyl
 
     def unmount_all(self) -> None:
-        for fly in self._live:
-            handle = getattr(fly.storage, 'read_handle', None)
+        for fyl in self._live:
+            handle = getattr(fyl.storage, 'read_handle', None)
             if handle is not None and not handle.closed:
                 handle.close()
         self._live.clear()
         gc.collect()
 
-    def remount(self, password: str = '') -> Fly:
-        """Unmount every live Fly and return a fresh mount for ``password``."""
+    def remount(self, password: str = '') -> Fyl:
+        """Unmount every live Fyl and return a fresh mount for ``password``."""
         self.unmount_all()
         return self.mount(password)
 
 
 @pytest.fixture
-def multi_fly(backing_file, fast_kdf):
-    """Drive several passwords against one backing file via ``MultiFly``.
+def multi_fyl(backing_file, fast_kdf):
+    """Drive several passwords against one backing file via ``MultiFyl``.
 
-    The fixture yields a ``MultiFly`` whose ``mount(password)`` opens a
-    fresh ``Fly`` over the shared backing file. ``unmount_all`` and
+    The fixture yields a ``MultiFyl`` whose ``mount(password)`` opens a
+    fresh ``Fyl`` over the shared backing file. ``unmount_all`` and
     ``remount`` release handles cleanly so tests can assert
     persistence without leaking low-level cleanup into the test body.
     The fixture also unmounts anything still live at teardown.
     """
-    path = backing_file(name='multi_fly_file')
-    mfly = MultiFly(path, fast_kdf)
+    path = backing_file(name='multi_fyl_file')
+    mfly = MultiFyl(path, fast_kdf)
     try:
         yield mfly
     finally:
@@ -139,11 +139,11 @@ def multi_fly(backing_file, fast_kdf):
 
 
 @pytest.fixture
-def fly(make_fly, password):
-    """A ready-to-use Fly for the common single-volume test case.
+def fyl(make_fyl, password):
+    """A ready-to-use Fyl for the common single-volume test case.
 
     Parametrised over an empty password (slot 0) and a real password
     (slot 1) so every test using this fixture runs twice.
     """
-    instance, _path, _reopen = make_fly(pw=password)
+    instance, _path, _reopen = make_fyl(pw=password)
     return instance

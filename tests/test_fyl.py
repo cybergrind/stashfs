@@ -1,4 +1,4 @@
-"""End-to-end tests for the ``Fly`` FUSE class.
+"""End-to-end tests for the ``Fyl`` FUSE class.
 
 Also covers the legacy ``FileWrapper`` / ``FileStructure`` classes which
 continue to live in the package for historical callers.
@@ -10,7 +10,7 @@ import errno
 
 import pytest
 
-from fyl import KDF, FileRecord, FileStructure, FileWrapper, Fly, KDFParams
+from fyl import KDF, FileRecord, FileStructure, FileWrapper, Fyl, KDFParams
 from fyl.fuse_app import _ensure_mountpoint, _looks_like_fuse_mount, _unmount_stale
 from fyl.volume import Volume
 from tests.conftest import FakeArgs
@@ -72,41 +72,41 @@ class TestFileStructure:
 
 
 class TestBasicFly:
-    """Behavioural end-to-end tests for the Fly FUSE class."""
+    """Behavioural end-to-end tests for the Fyl FUSE class."""
 
-    def test_add_one_file(self, make_fly, password):
-        fly, _path, _reopen = make_fly(pw=password)
-        fly.write('/new_file', b'new_file', 0)
-        fly.write('/new_file', b'12345678', 8)
-        assert fly.read('/new_file', 16, 0) == b'new_file12345678'
-        assert fly.volume.size_of('new_file') == 16
+    def test_add_one_file(self, make_fyl, password):
+        fyl, _path, _reopen = make_fyl(pw=password)
+        fyl.write('/new_file', b'new_file', 0)
+        fyl.write('/new_file', b'12345678', 8)
+        assert fyl.read('/new_file', 16, 0) == b'new_file12345678'
+        assert fyl.volume.size_of('new_file') == 16
 
-    def test_add_two_files(self, make_fly, password):
-        fly, _path, reopen = make_fly(pw=password)
-        fly.write('/new_file', b'new_file', 0)
-        fly.write('/new_file', b'12345678', 8)
+    def test_add_two_files(self, make_fyl, password):
+        fyl, _path, reopen = make_fyl(pw=password)
+        fyl.write('/new_file', b'new_file', 0)
+        fyl.write('/new_file', b'12345678', 8)
 
-        fly.write('/new_file2', b'new_file2', 0)
-        fly.write('/new_file2', b'87654321', 8)
+        fyl.write('/new_file2', b'new_file2', 0)
+        fyl.write('/new_file2', b'87654321', 8)
 
-        assert fly.read('/new_file', 8, 0) == b'new_file'
-        assert fly.read('/new_file2', 16, 0) == b'new_file87654321'
-        assert sorted(fly.volume.list()) == ['new_file', 'new_file2']
+        assert fyl.read('/new_file', 8, 0) == b'new_file'
+        assert fyl.read('/new_file2', 16, 0) == b'new_file87654321'
+        assert sorted(fyl.volume.list()) == ['new_file', 'new_file2']
 
         fly2 = reopen()
         assert fly2.read('/new_file', 8, 0) == b'new_file'
         assert fly2.read('/new_file2', 16, 0) == b'new_file87654321'
 
-    def test_remove_file(self, make_fly, password):
-        fly, _path, reopen = make_fly(pw=password)
-        fly.write('/new_file', b'new_file', 0)
-        fly.write('/new_file', b'12345678', 8)
-        fly.write('/new_file2', b'new_file2', 0)
-        fly.write('/new_file2', b'87654321', 8)
+    def test_remove_file(self, make_fyl, password):
+        fyl, _path, reopen = make_fyl(pw=password)
+        fyl.write('/new_file', b'new_file', 0)
+        fyl.write('/new_file', b'12345678', 8)
+        fyl.write('/new_file2', b'new_file2', 0)
+        fyl.write('/new_file2', b'87654321', 8)
 
-        assert fly.unlink('/new_file') == 0
-        assert not fly.volume.exists('new_file')
-        assert fly.read('/new_file2', 16, 0) == b'new_file87654321'
+        assert fyl.unlink('/new_file') == 0
+        assert not fyl.volume.exists('new_file')
+        assert fyl.read('/new_file2', 16, 0) == b'new_file87654321'
 
         fly2 = reopen()
         assert fly2.unlink('/new_file2') == 0
@@ -121,8 +121,8 @@ class TestBasicFly:
         path = backing_file()
         args = FakeArgs(fname=path)
 
-        def mount(pw: str) -> Fly:
-            f = Fly()
+        def mount(pw: str) -> Fyl:
+            f = Fyl()
             f.add_args(args, password=pw, kdf=fast_kdf)
             return f
 
@@ -168,8 +168,8 @@ class TestBasicFly:
         ):
             assert needle not in raw, f'{needle!r} leaked onto disk'
 
-    def test_read_missing_returns_enoent(self, fly):
-        assert fly.read('/nope', 10, 0) == -errno.ENOENT
+    def test_read_missing_returns_enoent(self, fyl):
+        assert fyl.read('/nope', 10, 0) == -errno.ENOENT
 
 
 class TestCoverFile:
@@ -181,7 +181,7 @@ class TestCoverFile:
     """
 
     def _cover_bytes(self) -> bytes:
-        # Anything that is *not* the shape of a fresh fly container.
+        # Anything that is *not* the shape of a fresh fyl container.
         return b'\x89PNG\r\n\x1a\n' + b'cover-bytes-' * 50
 
     def test_mount_on_existing_cover_file(self, tmp_path, fast_kdf):
@@ -189,14 +189,14 @@ class TestCoverFile:
         cover = self._cover_bytes()
         path.write_bytes(cover)
 
-        fly = Fly()
-        fly.add_args(FakeArgs(fname=path), password='', kdf=fast_kdf)
-        fly.write('/hidden.txt', b'only-inside-the-container', 0)
+        fyl = Fyl()
+        fyl.add_args(FakeArgs(fname=path), password='', kdf=fast_kdf)
+        fyl.write('/hidden.txt', b'only-inside-the-container', 0)
 
         on_disk = path.read_bytes()
         assert on_disk[: len(cover)] == cover, 'cover bytes were not preserved'
 
-        fly2 = Fly()
+        fly2 = Fyl()
         fly2.add_args(FakeArgs(fname=path), password='', kdf=fast_kdf)
         assert fly2.read('/hidden.txt', 100, 0) == b'only-inside-the-container'
 
@@ -205,8 +205,8 @@ class TestCoverFile:
         cover = self._cover_bytes()
         path.write_bytes(cover)
 
-        def mount(pw: str) -> Fly:
-            f = Fly()
+        def mount(pw: str) -> Fyl:
+            f = Fyl()
             f.add_args(FakeArgs(fname=path), password=pw, kdf=fast_kdf)
             return f
 
@@ -221,78 +221,78 @@ class TestCoverFile:
 class TestRename:
     """FUSE-level rename contract (``mv src dst``)."""
 
-    def test_rename_moves_file(self, fly):
-        fly.write('/old', b'payload', 0)
-        assert fly.rename('/old', '/new') == 0
-        assert fly.read('/new', 100, 0) == b'payload'
-        assert fly.read('/old', 100, 0) == -errno.ENOENT
+    def test_rename_moves_file(self, fyl):
+        fyl.write('/old', b'payload', 0)
+        assert fyl.rename('/old', '/new') == 0
+        assert fyl.read('/new', 100, 0) == b'payload'
+        assert fyl.read('/old', 100, 0) == -errno.ENOENT
 
-    def test_rename_missing_source_returns_enoent(self, fly):
-        assert fly.rename('/nope', '/dst') == -errno.ENOENT
+    def test_rename_missing_source_returns_enoent(self, fyl):
+        assert fyl.rename('/nope', '/dst') == -errno.ENOENT
 
-    def test_rename_overwrites_existing_destination(self, fly):
-        fly.write('/src', b'SRC', 0)
-        fly.write('/dst', b'DST-old-content', 0)
-        assert fly.rename('/src', '/dst') == 0
-        assert fly.read('/dst', 100, 0) == b'SRC'
-        assert fly.read('/src', 100, 0) == -errno.ENOENT
+    def test_rename_overwrites_existing_destination(self, fyl):
+        fyl.write('/src', b'SRC', 0)
+        fyl.write('/dst', b'DST-old-content', 0)
+        assert fyl.rename('/src', '/dst') == 0
+        assert fyl.read('/dst', 100, 0) == b'SRC'
+        assert fyl.read('/src', 100, 0) == -errno.ENOENT
 
-    def test_rename_to_self_is_noop(self, fly):
-        fly.write('/same', b'x', 0)
-        assert fly.rename('/same', '/same') == 0
-        assert fly.read('/same', 1, 0) == b'x'
+    def test_rename_to_self_is_noop(self, fyl):
+        fyl.write('/same', b'x', 0)
+        assert fyl.rename('/same', '/same') == 0
+        assert fyl.read('/same', 1, 0) == b'x'
 
 
 class TestFlyContract:
-    """Behavioral tests that lock in the contract of touched Fly methods."""
+    """Behavioral tests that lock in the contract of touched Fyl methods."""
 
-    def test_write_swallows_plain_exception_as_eio(self, fly, monkeypatch):
+    def test_write_swallows_plain_exception_as_eio(self, fyl, monkeypatch):
         def boom(*_args, **_kwargs):
             raise RuntimeError('simulated IO failure')
 
-        monkeypatch.setattr(fly.volume, 'write_file', boom)
-        assert fly.write('/new_file', b'payload', 0) == -errno.EIO
+        monkeypatch.setattr(fyl.volume, 'write_file', boom)
+        assert fyl.write('/new_file', b'payload', 0) == -errno.EIO
 
-    def test_write_propagates_keyboard_interrupt(self, fly, monkeypatch):
+    def test_write_propagates_keyboard_interrupt(self, fyl, monkeypatch):
         def boom(*_args, **_kwargs):
             raise KeyboardInterrupt
 
-        monkeypatch.setattr(fly.volume, 'write_file', boom)
+        monkeypatch.setattr(fyl.volume, 'write_file', boom)
         with pytest.raises(KeyboardInterrupt):
-            fly.write('/new_file', b'payload', 0)
+            fyl.write('/new_file', b'payload', 0)
 
-    def test_unlink_swallows_plain_exception_as_eio(self, fly, monkeypatch):
-        fly.write('/victim', b'data', 0)
+    def test_unlink_swallows_plain_exception_as_eio(self, fyl, monkeypatch):
+        fyl.write('/victim', b'data', 0)
 
         def boom(*_args, **_kwargs):
             raise RuntimeError('simulated IO failure')
 
-        monkeypatch.setattr(fly.volume, 'unlink', boom)
-        assert fly.unlink('/victim') == -errno.EIO
+        monkeypatch.setattr(fyl.volume, 'unlink', boom)
+        assert fyl.unlink('/victim') == -errno.EIO
 
-    def test_unlink_propagates_keyboard_interrupt(self, fly, monkeypatch):
-        fly.write('/victim', b'data', 0)
+    def test_unlink_propagates_keyboard_interrupt(self, fyl, monkeypatch):
+        fyl.write('/victim', b'data', 0)
 
         def boom(*_args, **_kwargs):
             raise KeyboardInterrupt
 
-        monkeypatch.setattr(fly.volume, 'unlink', boom)
+        monkeypatch.setattr(fyl.volume, 'unlink', boom)
         with pytest.raises(KeyboardInterrupt):
-            fly.unlink('/victim')
+            fyl.unlink('/victim')
 
-    def test_unlink_missing_returns_enoent(self, fly):
-        assert fly.unlink('/nope') == -errno.ENOENT
+    def test_unlink_missing_returns_enoent(self, fyl):
+        assert fyl.unlink('/nope') == -errno.ENOENT
 
-    def test_truncate_missing_returns_enoent(self, fly):
-        assert fly.truncate('/nope', 0) == -errno.ENOENT
+    def test_truncate_missing_returns_enoent(self, fyl):
+        assert fyl.truncate('/nope', 0) == -errno.ENOENT
 
 
 class TestFlyFixtures:
     """Smoke tests that confirm the shared fixtures wire things correctly."""
 
-    def test_make_fly_persists_across_reopen(self, make_fly, password):
-        fly, _path, reopen = make_fly(pw=password)
-        fly.write('/persisted', b'abcdefgh', 0)
+    def test_make_fyl_persists_across_reopen(self, make_fyl, password):
+        fyl, _path, reopen = make_fyl(pw=password)
+        fyl.write('/persisted', b'abcdefgh', 0)
 
         fly2 = reopen()
         assert fly2.read('/persisted', 8, 0) == b'abcdefgh'
@@ -301,10 +301,10 @@ class TestFlyFixtures:
         file_wrapper.write(2, b'xy')
         assert file_wrapper.path.read_bytes()[2:4] == b'xy'
 
-    def test_fly_volume_is_reachable(self, fly):
-        assert isinstance(fly.volume, Volume)
-        assert isinstance(fly.kdf, KDF)
-        assert fly.kdf.params == KDFParams.fast()
+    def test_fly_volume_is_reachable(self, fyl):
+        assert isinstance(fyl.volume, Volume)
+        assert isinstance(fyl.kdf, KDF)
+        assert fyl.kdf.params == KDFParams.fast()
 
 
 class TestTouchSemantics:
@@ -316,22 +316,22 @@ class TestTouchSemantics:
     the op must not crash).
     """
 
-    def test_utimens_accepts_two_timespecs(self, fly):
-        fly.write('/existing', b'x', 0)
+    def test_utimens_accepts_two_timespecs(self, fyl):
+        fyl.write('/existing', b'x', 0)
         # Sentinels stand in for fuse.Timespec - we ignore the values.
-        assert fly.utimens('/existing', object(), object()) == 0
+        assert fyl.utimens('/existing', object(), object()) == 0
 
-    def test_utimens_on_missing_returns_enoent(self, fly):
-        assert fly.utimens('/nope', object(), object()) == -errno.ENOENT
+    def test_utimens_on_missing_returns_enoent(self, fyl):
+        assert fyl.utimens('/nope', object(), object()) == -errno.ENOENT
 
-    def test_utimens_on_root_is_noop(self, fly):
-        assert fly.utimens('/', object(), object()) == 0
+    def test_utimens_on_root_is_noop(self, fyl):
+        assert fyl.utimens('/', object(), object()) == 0
 
-    def test_touch_like_sequence_succeeds(self, fly):
+    def test_touch_like_sequence_succeeds(self, fyl):
         # mknod (like open O_CREAT) then utimensat.
-        assert fly.mknod('/fresh', 0o644, 0) == 0
-        assert fly.utimens('/fresh', object(), object()) == 0
-        assert fly.getattr('/fresh').st_size == 0
+        assert fyl.mknod('/fresh', 0o644, 0) == 0
+        assert fyl.utimens('/fresh', object(), object()) == 0
+        assert fyl.getattr('/fresh').st_size == 0
 
 
 class TestEnsureMountpoint:
