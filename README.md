@@ -29,6 +29,10 @@ provided password matches none of them, the mount fails with
 Unmount with `fusermount -u <mountpoint>`; `stashfs` also auto-unmounts
 after `--ttl` seconds of idleness (default 300).
 
+Directories are supported: `mkdir`, `rmdir`, nested writes (`cp -r`,
+`tar x`, file managers), and subtree rename (`mv /a /b`) all work the
+way POSIX tools expect. Empty directories persist across unmount.
+
 Every mutation appends fresh chunks (append-only layer for crash
 safety) and marks the superseded ones DEAD in a plaintext allocation
 table. `stashfs optimize` reads that table and rebuilds the file

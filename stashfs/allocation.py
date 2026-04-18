@@ -10,7 +10,7 @@ On-disk layout of one alloc chunk (``CHUNK_FRAME_SIZE`` bytes total)::
     [8B  ALLOC_MAGIC                = b'STSHALOC']
     [8B  next_alloc_offset u64 BE   = SENTINEL for tail]
     [4B  count u32 BE]              # entries allocated in this chunk
-    [ENTRIES_PER_CHUNK × u32 BE]    # physical slot index, or DEAD_ENTRY
+    [ENTRIES_PER_CHUNK x u32 BE]    # physical slot index, or DEAD_ENTRY
 
 ``count`` is the high-water mark within a chunk: entries ``[0, count)``
 have been allocated at some point (and may now be DEAD), entries

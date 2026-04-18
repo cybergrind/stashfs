@@ -23,7 +23,7 @@ def storage(tmp_path):
 
 def _make_frame(seed: int) -> bytes:
     """Deterministic distinct payload per logical id for round-trip tests."""
-    return (bytes([seed % 256]) * CHUNK_FRAME_SIZE)
+    return bytes([seed % 256]) * CHUNK_FRAME_SIZE
 
 
 class TestAllocationAppendAndLookup:

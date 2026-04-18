@@ -130,6 +130,9 @@ class Stash(fuse.Fuse):
             st.st_mode = stat.S_IFREG | 0o644
             st.st_nlink = 1
             st.st_size = self.volume.size_of(name)
+        elif self.volume.is_dir(name):
+            st.st_mode = stat.S_IFDIR | 0o755
+            st.st_nlink = 2
         elif TIME_PAT.match(name):
             st.st_mode = stat.S_IFREG | 0o444
             st.st_nlink = 1
@@ -140,20 +143,60 @@ class Stash(fuse.Fuse):
 
     def readdir(self, path: str, offset: int):
         self._ctime = time.time()
+        name = path[1:] if path != '/' else ''
         for f in ['.', '..']:
             yield fuse.Direntry(f)
-        for name in self.volume.list():
-            yield fuse.Direntry(name, st_size=self.volume.size_of(name))
+        for child, kind in self.volume.iter_children(name):
+            if kind == 'file':
+                full = child if not name else f'{name}/{child}'
+                yield fuse.Direntry(child, st_size=self.volume.size_of(full))
+            else:
+                yield fuse.Direntry(child)
+
+    def mkdir(self, path: str, mode: int) -> int:
+        self._ctime = time.time()
+        name = path[1:]
+        try:
+            self.volume.mkdir(name)
+            return 0
+        except FileExistsError:
+            return -errno.EEXIST
+        except FileNotFoundError:
+            return -errno.ENOENT
+        except Exception:
+            log.exception('mkdir')
+            return -errno.EIO
+
+    def rmdir(self, path: str) -> int:
+        self._ctime = time.time()
+        name = path[1:]
+        try:
+            self.volume.rmdir(name)
+            return 0
+        except KeyError:
+            return -errno.ENOENT
+        except OSError as exc:
+            if exc.errno == errno.ENOTEMPTY:
+                return -errno.ENOTEMPTY
+            log.exception('rmdir')
+            return -errno.EIO
+        except Exception:
+            log.exception('rmdir')
+            return -errno.EIO
 
     def rename(self, old: str, new: str) -> int:
         self._ctime = time.time()
         old_name = old[1:]
         new_name = new[1:]
-        if not self.volume.exists(old_name):
+        if not self.volume.exists(old_name) and not self.volume.is_dir(old_name):
             return -errno.ENOENT
         try:
             self.volume.rename(old_name, new_name)
             return 0
+        except FileNotFoundError:
+            return -errno.ENOENT
+        except KeyError:
+            return -errno.ENOENT
         except Exception:
             log.exception('rename')
             return -errno.EIO
@@ -163,6 +206,11 @@ class Stash(fuse.Fuse):
         name = path[1:]
         if self.volume.exists(name):
             return -errno.EEXIST
+        if self.volume.is_dir(name):
+            return -errno.EISDIR
+        parent = name.rsplit('/', 1)[0] if '/' in name else ''
+        if parent and not self.volume.is_dir(parent):
+            return -errno.ENOENT
         try:
             self.volume.write_file(name, 0, b'')
         except Exception:
@@ -175,6 +223,11 @@ class Stash(fuse.Fuse):
         name = path[1:]
         if self.volume.exists(name):
             return -errno.EEXIST
+        if self.volume.is_dir(name):
+            return -errno.EISDIR
+        parent = name.rsplit('/', 1)[0] if '/' in name else ''
+        if parent and not self.volume.is_dir(parent):
+            return -errno.ENOENT
         try:
             self.volume.write_file(name, 0, b'')
         except Exception:
@@ -184,8 +237,10 @@ class Stash(fuse.Fuse):
 
     def write(self, path: str, buf: bytes, offset: int) -> int:
         self._ctime = time.time()
+        name = path[1:]
+        if self.volume.is_dir(name):
+            return -errno.EISDIR
         try:
-            name = path[1:]
             self.volume.write_file(name, offset, buf)
             return len(buf)
         except Exception:
@@ -207,6 +262,8 @@ class Stash(fuse.Fuse):
         self._ctime = time.time()
         try:
             name = path[1:]
+            if self.volume.is_dir(name) and not self.volume.exists(name):
+                return -errno.EISDIR
             if not self.volume.exists(name):
                 return -errno.ENOENT
             self.volume.unlink(name)
@@ -219,6 +276,8 @@ class Stash(fuse.Fuse):
         self._ctime = time.time()
         try:
             name = path[1:]
+            if self.volume.is_dir(name) and not self.volume.exists(name):
+                return -errno.EISDIR
             if not self.volume.exists(name):
                 return -errno.ENOENT
             self.volume.truncate(name, size)

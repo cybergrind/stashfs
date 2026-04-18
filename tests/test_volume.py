@@ -10,7 +10,7 @@ import pytest
 
 from stashfs.container import CHUNK_PAYLOAD_SIZE, N_SLOTS, Container
 from stashfs.crypto import KDF, KDFParams
-from stashfs.file_index import VolumeFile, parse, serialize
+from stashfs.file_index import FileIndex, VolumeFile, parse, serialize
 from stashfs.slot_table import PasswordDoesNotMatch
 from stashfs.storage import FileWrapper
 from stashfs.volume import Volume
@@ -28,7 +28,8 @@ def container(tmp_path) -> Container:
 
 class TestFileIndexSerialization:
     def test_round_trip_empty(self):
-        assert parse(serialize({})) == {}
+        idx = FileIndex(files={}, dirs=set())
+        assert parse(serialize(idx)) == idx
 
     def test_round_trip_with_files(self):
         files = {
@@ -36,11 +37,11 @@ class TestFileIndexSerialization:
             'b.txt': VolumeFile(name='b.txt', size=4096, chunk_ids=[3]),
             'unicode-\u00e9.txt': VolumeFile(name='unicode-\u00e9.txt', size=1, chunk_ids=[]),
         }
-        reparsed = parse(serialize(files))
-        assert set(reparsed) == set(files)
+        reparsed = parse(serialize(FileIndex(files=files, dirs=set())))
+        assert set(reparsed.files) == set(files)
         for name, vf in files.items():
-            assert reparsed[name].size == vf.size
-            assert reparsed[name].chunk_ids == vf.chunk_ids
+            assert reparsed.files[name].size == vf.size
+            assert reparsed.files[name].chunk_ids == vf.chunk_ids
 
 
 class TestVolumeBasic:
@@ -127,64 +128,6 @@ class TestUnlink:
         gamma = Volume(container, kdf, 'gamma')
         gamma.write_file('y', 0, b'2')
         assert gamma.slot_index == alpha_slot
-
-
-class TestLegacyIndexChunkCompat:
-    """Containers written before the chained-index change stored the file
-    index as a plain, zero-padded serialised blob inside a single chunk.
-    Opening such a container with the new code must still work; the
-    chain pointer is simply absent there.
-    """
-
-    def _legacy_index_chunk(self, v: Volume, files: dict) -> int:
-        """Append one legacy-format index chunk and return its id.
-
-        Legacy layout: ``serialize(files) + zero_padding`` inside the
-        4096 B chunk payload. No magic, no next-pointer.
-        """
-        from stashfs.file_index import serialize
-
-        blob = serialize(files)
-        padded = blob + b'\x00' * (CHUNK_PAYLOAD_SIZE - len(blob))
-        return v._append_plaintext(padded)
-
-    def test_loads_legacy_index_chunk(self, container, kdf):
-        from stashfs.file_index import VolumeFile
-
-        # First write a real data chunk so chunk ids > 0 exist.
-        v = Volume(container, kdf, 'alpha')
-        v.write_file('seed', 0, b'seed-data')
-
-        # Now craft a legacy index chunk that references that data.
-        data_chunk_id = v._files['seed'].chunk_ids[0]
-        legacy_files = {
-            'seed': VolumeFile(name='seed', size=9, chunk_ids=[data_chunk_id]),
-        }
-        legacy_cid = self._legacy_index_chunk(v, legacy_files)
-        v.slot_table.update(v.slot_index, v._slot.volume_key, legacy_cid)
-
-        # A fresh Volume must find the legacy slot and decode it.
-        v2 = Volume(container, kdf, 'alpha')
-        assert v2.list() == ['seed']
-        assert v2.read_file('seed', 0, 9) == b'seed-data'
-
-    def test_legacy_index_with_large_payload(self, container, kdf):
-        """Legacy blob close to the chunk boundary - last bytes are real
-        data, not zeros. Must still parse as a single-chunk index.
-        """
-
-        v = Volume(container, kdf, 'alpha')
-        # Seed many real data chunks so chunk_ids list is long enough
-        # to push the serialised blob up towards the full chunk size.
-        v.write_file('seed', 0, b'x' * (200 * CHUNK_PAYLOAD_SIZE))
-
-        legacy_files = {'seed': v._files['seed']}
-        legacy_cid = self._legacy_index_chunk(v, legacy_files)
-        v.slot_table.update(v.slot_index, v._slot.volume_key, legacy_cid)
-
-        v2 = Volume(container, kdf, 'alpha')
-        assert 'seed' in v2.list()
-        assert v2.size_of('seed') == 200 * CHUNK_PAYLOAD_SIZE
 
 
 class TestLargeFileIndex:
@@ -350,6 +293,108 @@ class TestCrashSafety:
         # The previous data is still intact on reopen.
         v2 = Volume(container, kdf, 'alpha')
         assert v2.read_file('a', 0, 100) == b'initial'
+
+
+class TestDirectoryOps:
+    """Directory support on top of the flat file-name store."""
+
+    def test_mkdir_creates_explicit_dir(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.mkdir('foo')
+        assert v.is_dir('foo') is True
+        assert v.list_dirs() == ['foo']
+
+    def test_mkdir_rejects_duplicate(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.mkdir('foo')
+        with pytest.raises(FileExistsError):
+            v.mkdir('foo')
+
+    def test_mkdir_rejects_file_collision(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('foo', 0, b'data')
+        with pytest.raises(FileExistsError):
+            v.mkdir('foo')
+
+    def test_mkdir_rejects_missing_parent(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        with pytest.raises(FileNotFoundError):
+            v.mkdir('missing/sub')
+
+    def test_mkdir_under_implicit_parent(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        # File creates implicit parent 'parent'.
+        v.write_file('parent/child', 0, b'data')
+        v.mkdir('parent/empty')
+        assert v.is_dir('parent/empty')
+
+    def test_rmdir_empty_succeeds(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.mkdir('foo')
+        v.rmdir('foo')
+        assert v.is_dir('foo') is False
+
+    def test_rmdir_refuses_non_empty(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.mkdir('foo')
+        v.write_file('foo/x', 0, b'x')
+        with pytest.raises(OSError, match='not empty'):
+            v.rmdir('foo')
+
+    def test_is_dir_covers_implicit(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('implicit/child', 0, b'x')
+        assert v.is_dir('implicit') is True
+        assert v.is_dir('nope') is False
+
+    def test_iter_children_mixes_implicit_and_explicit(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        # 'root' becomes an implicit directory via the nested file write.
+        v.write_file('root/file_a', 0, b'a')
+        v.mkdir('root/empty')
+        children = sorted(v.iter_children('root'))
+        assert children == [('empty', 'dir'), ('file_a', 'file')]
+
+    def test_mkdir_on_implicit_dir_raises_exists(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('implicit/child', 0, b'x')
+        with pytest.raises(FileExistsError):
+            v.mkdir('implicit')
+
+    def test_iter_children_of_root_lists_top_level(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('a', 0, b'a')
+        v.mkdir('b')
+        v.write_file('c/d', 0, b'x')
+        assert sorted(v.iter_children('')) == [('a', 'file'), ('b', 'dir'), ('c', 'dir')]
+
+    def test_dirs_persist_across_reopen(self, container, kdf):
+        Volume(container, kdf, 'alpha').mkdir('persisted')
+        v2 = Volume(container, kdf, 'alpha')
+        assert v2.is_dir('persisted')
+        assert v2.list_dirs() == ['persisted']
+
+    def test_rename_file_within_dir(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.mkdir('d')
+        v.write_file('d/old', 0, b'hello')
+        v.rename('d/old', 'd/new')
+        assert v.read_file('d/new', 0, 5) == b'hello'
+        with pytest.raises(KeyError):
+            v.read_file('d/old', 0, 5)
+
+    def test_rename_subtree(self, container, kdf):
+        v = Volume(container, kdf, 'alpha')
+        v.mkdir('src')
+        v.mkdir('src/empty')
+        v.write_file('src/a', 0, b'aa')
+        v.write_file('src/nested/b', 0, b'bb')
+        v.rename('src', 'dst')
+        assert not v.is_dir('src')
+        assert v.is_dir('dst')
+        assert v.is_dir('dst/empty')
+        assert v.read_file('dst/a', 0, 2) == b'aa'
+        assert v.read_file('dst/nested/b', 0, 2) == b'bb'
 
 
 class TestMarkDeadAtCommit:

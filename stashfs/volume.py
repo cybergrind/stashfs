@@ -13,11 +13,19 @@ from __future__ import annotations
 
 import os
 import struct
+from collections.abc import Iterator
 
 from stashfs.container import CHUNK_PAYLOAD_SIZE, Container
 from stashfs.crypto import KDF, AEADChunk
-from stashfs.file_index import VolumeFile, parse, serialize
+from stashfs.file_index import FileIndex, VolumeFile, parse, serialize
 from stashfs.slot_table import SlotInfo, SlotTable
+
+
+def _parent_of(name: str) -> str:
+    """Return the parent directory of ``name`` (``''`` for top level)."""
+    if '/' not in name:
+        return ''
+    return name.rsplit('/', 1)[0]
 
 
 class VolumeCorrupt(Exception):
@@ -34,14 +42,15 @@ class VolumeCorrupt(Exception):
 # sees a chunk that does not begin with the magic it falls back to the
 # legacy reader and treats the whole 4096-byte plaintext as a one-shot
 # payload. ``INDEX_CHAIN_END`` marks the last chunk in a chain.
-INDEX_MAGIC = b'FIDXv001'
+INDEX_MAGIC = b'FIDXv002'
 INDEX_HEADER_SIZE = len(INDEX_MAGIC) + 8
 INDEX_PAYLOAD_SIZE = CHUNK_PAYLOAD_SIZE - INDEX_HEADER_SIZE
 INDEX_CHAIN_END = 0xFFFF_FFFF_FFFF_FFFF
 
-# Type alias so pyrefly doesn't confuse the builtin ``list`` with the
+# Type aliases so pyrefly doesn't confuse the builtin ``list`` with the
 # ``Volume.list`` method when evaluating annotations inside the class.
 _ChunkIds = list[int]
+_NameList = list[str]
 
 
 def write_index_chain(container: Container, cipher: AEADChunk, blob: bytes) -> tuple[int, list[int]]:
@@ -92,6 +101,7 @@ class Volume:
         self._slot = self.slot_table.find_or_create()
         self._cipher = AEADChunk(self._slot.volume_key)
         self._files: dict[str, VolumeFile] = {}
+        self._dirs: set[str] = set()
         # The chunk ids making up the currently-live file-index chain.
         # We remember them so we can mark-dead the chain when it's
         # superseded on the next commit.
@@ -110,11 +120,101 @@ class Volume:
     def list(self) -> list[str]:
         return sorted(self._files)
 
+    def list_dirs(self) -> _NameList:
+        return sorted(self._dirs)
+
     def size_of(self, name: str) -> int:
         return self._files[name].size
 
     def exists(self, name: str) -> bool:
         return name in self._files
+
+    # -------- directory operations --------
+
+    def is_dir(self, name: str) -> bool:
+        """True iff ``name`` is an explicit or implicit directory."""
+        if name == '':
+            return True  # root
+        if name in self._dirs:
+            return True
+        prefix = name + '/'
+        return any(f.startswith(prefix) for f in self._files) or any(d.startswith(prefix) for d in self._dirs)
+
+    def mkdir(self, name: str) -> None:
+        """Register an explicit empty directory at ``name``."""
+        if name == '':
+            raise FileExistsError('')
+        if name in self._files:
+            raise FileExistsError(name)
+        if self.is_dir(name):
+            raise FileExistsError(name)
+        parent = _parent_of(name)
+        if not self.is_dir(parent):
+            raise FileNotFoundError(parent)
+        self._dirs.add(name)
+        self._persist_file_index()
+
+    def rmdir(self, name: str) -> None:
+        """Remove an empty directory.
+
+        Fails if the directory has any children (implicit or explicit).
+        Raises ``KeyError`` if the name isn't a directory, ``OSError``
+        (``ENOTEMPTY``) if non-empty.
+        """
+        import errno as _errno
+
+        if not self.is_dir(name):
+            raise KeyError(name)
+        prefix = name + '/' if name else ''
+        has_child = any(f.startswith(prefix) for f in self._files) or any(
+            d.startswith(prefix) and d != name for d in self._dirs
+        )
+        if has_child:
+            raise OSError(_errno.ENOTEMPTY, f'directory not empty: {name!r}')
+        self._dirs.discard(name)
+        self._persist_file_index()
+
+    def iter_children(self, parent: str) -> Iterator[tuple[str, str]]:
+        """Yield ``(basename, kind)`` for direct children of ``parent``.
+
+        ``parent=''`` means the root. ``kind`` is ``'file'`` or
+        ``'dir'``. A name that matches both (shouldn't happen) is
+        reported once as ``'file'``.
+        """
+        prefix = parent + '/' if parent else ''
+        seen: set[str] = set()
+        for name in self._files:
+            if not name.startswith(prefix):
+                continue
+            rest = name[len(prefix) :]
+            if not rest or '/' in rest:
+                # A child implied by a deeper descendant — surface it
+                # as an implicit directory below, not a file.
+                continue
+            seen.add(rest)
+            yield (rest, 'file')
+        for name in self._dirs:
+            if name == parent:
+                continue
+            if not name.startswith(prefix):
+                continue
+            head = name[len(prefix) :].split('/', 1)[0]
+            if head in seen:
+                continue
+            seen.add(head)
+            yield (head, 'dir')
+        # Implicit sub-directories derived from deeper file paths.
+        for name in self._files:
+            if not name.startswith(prefix):
+                continue
+            rest = name[len(prefix) :]
+            if '/' not in rest:
+                continue
+            head = rest.split('/', 1)[0]
+            if head in seen:
+                continue
+            seen.add(head)
+            yield (head, 'dir')
 
     def read_file(self, name: str, offset: int, size: int) -> bytes:
         file = self._files.get(name)
@@ -226,21 +326,57 @@ class Volume:
     def rename(self, old: str, new: str) -> None:
         """Rename ``old`` to ``new`` within this volume.
 
-        Overwrites ``new`` if it already exists. Renaming to the same
-        name is a no-op. Raises ``KeyError`` if ``old`` does not exist.
-        The move is pure metadata: we just re-key the entry in the file
-        index and rewrite the index chunk. Data chunks stay where they
-        are.
+        ``old`` may be a file or a directory (explicit or implicit).
+        Renaming a directory rewrites every child path in ``_files``
+        and ``_dirs`` whose key starts with ``old + '/'``. The move is
+        pure metadata; data chunks stay where they are.
+
+        Overwrites ``new`` if it already exists as a file with the
+        same role (file → file). Renaming to the same name is a no-op.
         """
         if old == new:
-            if old not in self._files:
+            if old not in self._files and not self.is_dir(old):
                 raise KeyError(old)
             return
-        if old not in self._files:
-            raise KeyError(old)
-        entry = self._files.pop(old)
-        self._files[new] = VolumeFile(name=new, size=entry.size, chunk_ids=entry.chunk_ids)
-        self._persist_file_index()
+        new_parent = _parent_of(new)
+        if not self.is_dir(new_parent):
+            raise FileNotFoundError(new_parent)
+
+        if old in self._files:
+            entry = self._files.pop(old)
+            self._files[new] = VolumeFile(name=new, size=entry.size, chunk_ids=entry.chunk_ids)
+            self._persist_file_index()
+            return
+
+        if self.is_dir(old):
+            self._rename_subtree(old, new)
+            self._persist_file_index()
+            return
+
+        raise KeyError(old)
+
+    def _rename_subtree(self, old: str, new: str) -> None:
+        """Rewrite every ``_files`` and ``_dirs`` entry under ``old/`` to ``new/``."""
+        old_prefix = old + '/'
+        renamed_files: list[tuple[str, str]] = []
+        for name in list(self._files):
+            if name == old:
+                renamed_files.append((name, new))
+            elif name.startswith(old_prefix):
+                renamed_files.append((name, new + '/' + name[len(old_prefix) :]))
+        for src, dst in renamed_files:
+            entry = self._files.pop(src)
+            self._files[dst] = VolumeFile(name=dst, size=entry.size, chunk_ids=entry.chunk_ids)
+
+        renamed_dirs: list[tuple[str, str]] = []
+        for name in list(self._dirs):
+            if name == old:
+                renamed_dirs.append((name, new))
+            elif name.startswith(old_prefix):
+                renamed_dirs.append((name, new + '/' + name[len(old_prefix) :]))
+        for src, dst in renamed_dirs:
+            self._dirs.discard(src)
+            self._dirs.add(dst)
 
     def unlink(self, name: str) -> None:
         if name not in self._files:
@@ -275,16 +411,17 @@ class Volume:
     def _load_file_index(self) -> None:
         assert self._slot.file_table_chunk_id is not None
         blob, chain_ids = self._read_index_chain(self._slot.file_table_chunk_id)
-        self._files = parse(blob)
+        index = parse(blob)
+        self._files = index.files
+        self._dirs = index.dirs
         self._index_chain_ids = chain_ids
 
     def _read_index_chain(self, head_chunk_id: int) -> tuple[bytes, _ChunkIds]:
         """Walk the ``next``-pointer chain starting at ``head_chunk_id``.
 
-        Auto-detects the legacy single-chunk index format: a chunk whose
-        plaintext does *not* start with ``INDEX_MAGIC`` is treated as a
-        zero-padded serialised blob with no chain pointer. This lets
-        containers written before the chained-index change still open.
+        Every chunk must begin with ``INDEX_MAGIC`` (``FIDXv002``). The
+        pre-magic legacy format (``FIDXv001`` and the earlier no-magic
+        blob) is not supported; such chunks raise ``VolumeCorrupt``.
 
         Returns ``(blob, chain_ids)`` — the concatenated payload and the
         list of chunk ids walked (head first).
@@ -299,20 +436,16 @@ class Volume:
             seen.add(cid)
             chain_ids.append(cid)
             plaintext = self._decrypt_chunk(cid)
-            if plaintext[: len(INDEX_MAGIC)] == INDEX_MAGIC:
-                (next_cid,) = struct.unpack('>Q', plaintext[len(INDEX_MAGIC) : INDEX_HEADER_SIZE])
-                payload = plaintext[INDEX_HEADER_SIZE:]
-                out.extend(payload)
-                cid = next_cid
-            else:
-                # Legacy v0: whole plaintext is the serialised blob
-                # (zero-padded). No chain, stop after this chunk.
-                out.extend(plaintext)
-                break
+            if plaintext[: len(INDEX_MAGIC)] != INDEX_MAGIC:
+                raise VolumeCorrupt(f'unsupported file-index version at chunk {cid}: expected {INDEX_MAGIC!r}')
+            (next_cid,) = struct.unpack('>Q', plaintext[len(INDEX_MAGIC) : INDEX_HEADER_SIZE])
+            payload = plaintext[INDEX_HEADER_SIZE:]
+            out.extend(payload)
+            cid = next_cid
         return bytes(out), chain_ids
 
     def _persist_file_index(self) -> None:
-        blob = serialize(self._files)
+        blob = serialize(FileIndex(files=self._files, dirs=self._dirs))
         new_head_id, new_chain_ids = write_index_chain(self.container, self._cipher, blob)
         if self._slot.file_table_chunk_id is None:
             slot_index = self._reserve_slot_for_associate()

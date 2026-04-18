@@ -218,6 +218,64 @@ class TestCoverFile:
         assert path.read_bytes()[: len(cover)] == cover
 
 
+class TestDirectories:
+    """`Stash` must expose POSIX-like directory semantics via FUSE."""
+
+    def test_mkdir_then_create_child_works(self, stash):
+        import stat as _stat
+
+        assert stash.mkdir('/foo', 0o755) == 0
+        st = stash.getattr('/foo')
+        assert st.st_mode & _stat.S_IFDIR
+        assert stash.mknod('/foo/hello.txt', 0o644, 0) == 0
+        assert stash.write('/foo/hello.txt', b'payload', 0) == 7
+        assert stash.read('/foo/hello.txt', 7, 0) == b'payload'
+
+    def test_mkdir_duplicate_returns_eexist(self, stash):
+        assert stash.mkdir('/foo', 0o755) == 0
+        assert stash.mkdir('/foo', 0o755) == -errno.EEXIST
+
+    def test_mkdir_missing_parent_returns_enoent(self, stash):
+        assert stash.mkdir('/a/b', 0o755) == -errno.ENOENT
+
+    def test_rmdir_empty_succeeds(self, stash):
+        assert stash.mkdir('/foo', 0o755) == 0
+        assert stash.rmdir('/foo') == 0
+        assert stash.getattr('/foo') == -errno.ENOENT
+
+    def test_rmdir_non_empty_returns_enotempty(self, stash):
+        assert stash.mkdir('/foo', 0o755) == 0
+        assert stash.mknod('/foo/x', 0o644, 0) == 0
+        assert stash.rmdir('/foo') == -errno.ENOTEMPTY
+
+    def test_unlink_on_directory_returns_eisdir(self, stash):
+        assert stash.mkdir('/foo', 0o755) == 0
+        assert stash.unlink('/foo') == -errno.EISDIR
+
+    def test_readdir_scopes_to_requested_dir(self, stash):
+        assert stash.mkdir('/a', 0o755) == 0
+        assert stash.mkdir('/b', 0o755) == 0
+        assert stash.mknod('/a/x', 0o644, 0) == 0
+        assert stash.mknod('/b/y', 0o644, 0) == 0
+        assert stash.mknod('/b/z', 0o644, 0) == 0
+
+        root_names = {e.name for e in stash.readdir('/', 0)}
+        assert 'a' in root_names
+        assert 'b' in root_names
+
+        b_names = {e.name for e in stash.readdir('/b', 0)}
+        assert b_names - {'.', '..'} == {'y', 'z'}
+
+    def test_rename_subtree(self, stash):
+        assert stash.mkdir('/src', 0o755) == 0
+        assert stash.mknod('/src/file', 0o644, 0) == 0
+        assert stash.write('/src/file', b'hello', 0) == 5
+
+        assert stash.rename('/src', '/dst') == 0
+        assert stash.getattr('/src') == -errno.ENOENT
+        assert stash.read('/dst/file', 5, 0) == b'hello'
+
+
 class TestRename:
     """FUSE-level rename contract (``mv src dst``)."""
 

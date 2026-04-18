@@ -173,3 +173,104 @@ class TestRealisticWorkload:
             b'a10_copy',
         ):
             assert needle not in raw, f'{needle!r} leaked onto disk'
+
+
+class TestRealisticDirectoryWorkflow:
+    """Mirror of the user's actual workflow: mkdir, cp into dir, mv subtree, rmdir."""
+
+    def test_mkdir_cp_mv_rmdir_across_passwords(self, multi_stash):
+        rng = random.Random(42)
+
+        # -- alpha: build a nested tree with a mix of file sizes --
+        alpha = multi_stash.mount('alpha')
+        assert alpha.mkdir('/docs', 0o755) == 0
+        assert alpha.mkdir('/docs/drafts', 0o755) == 0
+        assert alpha.mkdir('/photos', 0o755) == 0
+        assert alpha.mkdir('/empty', 0o755) == 0  # explicit empty dir
+
+        readme = _payload(rng, b'LEAK-ALPHA-README', 5 * 1024)
+        draft = _payload(rng, b'LEAK-ALPHA-DRAFT', 50 * 1024)
+        photo = _payload(rng, b'LEAK-ALPHA-PHOTO', 200 * 1024)
+        tiny = _payload(rng, b'LEAK-ALPHA-TINY', 17)
+
+        assert alpha.mknod('/docs/readme.md', 0o644, 0) == 0
+        assert alpha.write('/docs/readme.md', readme, 0) == len(readme)
+        assert alpha.mknod('/docs/drafts/v1.txt', 0o644, 0) == 0
+        assert alpha.write('/docs/drafts/v1.txt', draft, 0) == len(draft)
+        assert alpha.mknod('/photos/cover.bin', 0o644, 0) == 0
+        assert alpha.write('/photos/cover.bin', photo, 0) == len(photo)
+        assert alpha.mknod('/photos/tiny', 0o644, 0) == 0
+        assert alpha.write('/photos/tiny', tiny, 0) == len(tiny)
+
+        # Listing the root should see all four top-level dirs.
+        root = {e.name for e in alpha.readdir('/', 0)} - {'.', '..'}
+        assert root == {'docs', 'photos', 'empty'}
+
+        # Listing a sub-dir respects scoping.
+        docs_listing = {e.name for e in alpha.readdir('/docs', 0)} - {'.', '..'}
+        assert docs_listing == {'readme.md', 'drafts'}
+
+        # -- mv: rename /docs -> /archive (subtree move) --
+        assert alpha.rename('/docs', '/archive') == 0
+        assert alpha.getattr('/docs') == -errno.ENOENT
+        assert alpha.read('/archive/readme.md', len(readme), 0) == readme
+        assert alpha.read('/archive/drafts/v1.txt', len(draft), 0) == draft
+
+        # -- rmdir refuses non-empty, then succeeds on empty --
+        assert alpha.rmdir('/archive') == -errno.ENOTEMPTY
+        assert alpha.rmdir('/empty') == 0
+        assert alpha.getattr('/empty') == -errno.ENOENT
+
+        # -- unlink into an implicit dir removes the file but dir stays
+        # implicit as long as siblings exist --
+        assert alpha.unlink('/photos/tiny') == 0
+        assert alpha.getattr('/photos/tiny') == -errno.ENOENT
+        assert alpha.getattr('/photos').st_mode & 0o040000  # S_IFDIR
+
+        # -- beta: separate volume, independent namespace --
+        beta = multi_stash.mount('beta')
+        assert beta.mkdir('/secret', 0o755) == 0
+        secret_payload = _payload(rng, b'LEAK-BETA-SECRET', 70 * 1024)
+        assert beta.mknod('/secret/file', 0o644, 0) == 0
+        assert beta.write('/secret/file', secret_payload, 0) == len(secret_payload)
+
+        # Alpha can't see beta's dirs.
+        assert alpha.getattr('/secret') == -errno.ENOENT
+
+        # -- unmount + remount: everything round-trips with checksums --
+        multi_stash.unmount_all()
+
+        expected_alpha = {
+            '/archive/readme.md': _sha256(readme),
+            '/archive/drafts/v1.txt': _sha256(draft),
+            '/photos/cover.bin': _sha256(photo),
+        }
+        expected_alpha_dirs = {'archive', 'archive/drafts', 'photos'}
+
+        expected_beta = {'/secret/file': _sha256(secret_payload)}
+        expected_beta_dirs = {'secret'}
+
+        alpha_ro = multi_stash.mount('alpha')
+        for path, want_hash in expected_alpha.items():
+            name = path[1:]
+            size = alpha_ro.volume.size_of(name)
+            data = alpha_ro.read(path, size, 0)
+            assert isinstance(data, bytes)
+            assert _sha256(data) == want_hash, path
+        for d in expected_alpha_dirs:
+            assert alpha_ro.volume.is_dir(d), d
+
+        beta_ro = multi_stash.mount('beta')
+        for path, want_hash in expected_beta.items():
+            name = path[1:]
+            size = beta_ro.volume.size_of(name)
+            data = beta_ro.read(path, size, 0)
+            assert isinstance(data, bytes)
+            assert _sha256(data) == want_hash, path
+        for d in expected_beta_dirs:
+            assert beta_ro.volume.is_dir(d), d
+
+        # -- leak check: dir names must not appear in plaintext on disk --
+        raw = multi_stash.path.read_bytes()
+        for needle in (b'archive', b'drafts', b'photos', b'secret', b'readme.md', b'cover.bin'):
+            assert needle not in raw, f'{needle!r} leaked onto disk'

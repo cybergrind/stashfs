@@ -7,6 +7,7 @@ is the only reclamation path. Tests drive one behaviour at a time using
 
 from __future__ import annotations
 
+import errno
 import hashlib
 
 import pytest
@@ -183,6 +184,86 @@ class TestOptimizePasswordless:
         # Slot 1 is free -> mounting 'alpha' creates a fresh empty volume.
         alpha_ro = multi_stash.mount('alpha')
         assert alpha_ro.volume.list() == []
+
+
+class TestOptimizeWithDirectories:
+    """`optimize` must keep shrinking the file when directories churn too."""
+
+    def test_optimize_reclaims_after_dir_churn(self, multi_stash, fast_kdf):
+        alpha = multi_stash.mount('alpha')
+        # Heavy churn inside directories.
+        assert alpha.mkdir('/staging', 0o755) == 0
+        assert alpha.mkdir('/staging/tmp', 0o755) == 0
+        payload = b'Z' * (200 * 1024)
+        for i in range(6):
+            path = f'/staging/tmp/f{i}'
+            assert alpha.mknod(path, 0o644, 0) == 0
+            assert alpha.write(path, payload, 0) == len(payload)
+        # Remove all but one.
+        for i in range(1, 6):
+            assert alpha.unlink(f'/staging/tmp/f{i}') == 0
+        # Rename the subtree, then the remaining file.
+        assert alpha.rename('/staging', '/archive') == 0
+        multi_stash.unmount_all()
+
+        old_size = multi_stash.path.stat().st_size
+        report = optimize(multi_stash.path, [], kdf=fast_kdf)
+        new_size = multi_stash.path.stat().st_size
+
+        assert report.reclaimed == old_size - new_size
+        assert new_size < old_size * 0.4, f'expected major reclaim, got {old_size} -> {new_size}'
+
+        # Everything still reads back; directories are intact.
+        reopened = multi_stash.mount('alpha')
+        assert reopened.volume.is_dir('archive')
+        assert reopened.volume.is_dir('archive/tmp')
+        assert reopened.read('/archive/tmp/f0', len(payload), 0) == payload
+        # Deleted files truly gone.
+        assert reopened.getattr('/archive/tmp/f5') == -errno.ENOENT
+
+    def test_optimize_is_idempotent_after_dir_ops(self, multi_stash, fast_kdf):
+        alpha = multi_stash.mount('alpha')
+        assert alpha.mkdir('/d', 0o755) == 0
+        assert alpha.mknod('/d/file', 0o644, 0) == 0
+        assert alpha.write('/d/file', b'payload', 0) == 7
+        multi_stash.unmount_all()
+
+        optimize(multi_stash.path, [], kdf=fast_kdf)
+        second = optimize(multi_stash.path, [], kdf=fast_kdf)
+        assert second.reclaimed == 0
+
+        reopened = multi_stash.mount('alpha')
+        assert reopened.read('/d/file', 7, 0) == b'payload'
+        assert reopened.volume.is_dir('d')
+
+    def test_empty_dir_survives_optimize(self, multi_stash, fast_kdf):
+        """A lone `mkdir` with no files must persist across optimize."""
+        alpha = multi_stash.mount('alpha')
+        assert alpha.mkdir('/just-a-dir', 0o755) == 0
+        multi_stash.unmount_all()
+
+        optimize(multi_stash.path, [], kdf=fast_kdf)
+
+        reopened = multi_stash.mount('alpha')
+        assert reopened.volume.is_dir('just-a-dir')
+        # And specifically *explicit*, not just implicit (nothing lives under it).
+        assert 'just-a-dir' in reopened.volume.list_dirs()
+
+    def test_optimize_preserves_locked_slot_with_dirs(self, multi_stash, fast_kdf):
+        """Locked slots that used directories must round-trip after optimize."""
+        alpha = multi_stash.mount('alpha')
+        assert alpha.mkdir('/secret', 0o755) == 0
+        assert alpha.mknod('/secret/file', 0o644, 0) == 0
+        assert alpha.write('/secret/file', b'hidden', 0) == 6
+        multi_stash.unmount_all()
+
+        # No password supplied; alpha's slot stays locked.
+        optimize(multi_stash.path, [], kdf=fast_kdf)
+
+        # Re-mount under the original password; nothing was lost.
+        reopened = multi_stash.mount('alpha')
+        assert reopened.volume.is_dir('secret')
+        assert reopened.read('/secret/file', 6, 0) == b'hidden'
 
 
 class TestOptimizeErrors:
