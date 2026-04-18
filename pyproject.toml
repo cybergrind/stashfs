@@ -25,6 +25,7 @@ packages = ['fyl']
 [tool.hatch.build.targets.sdist]
 exclude = [
   '/.*',
+  '/*.png',
   '/CLAUDE.md',
   '/requirements.txt',
 ]
