@@ -121,6 +121,11 @@ class Allocation:
     @classmethod
     def open(cls, storage: Storage, chunk_area_start: int, head_offset: int) -> Allocation:
         """Walk the alloc chain starting at ``head_offset`` and rebuild state."""
+        chunks = cls._read_chain(storage, head_offset)
+        return cls(storage, chunk_area_start, chunks)
+
+    @staticmethod
+    def _read_chain(storage: Storage, head_offset: int) -> list[_AllocChunk]:
         chunks: list[_AllocChunk] = []
         seen: set[int] = set()
         current = head_offset
@@ -134,7 +139,18 @@ class Allocation:
             current = chunk.next_offset
         if not chunks:
             raise ValueError('alloc chain is empty')
-        return cls(storage, chunk_area_start, chunks)
+        return chunks
+
+    def reload(self) -> None:
+        """Re-read the alloc chain from disk, replacing in-memory state.
+
+        Use this when another writer (e.g. a sibling ``Volume`` sharing
+        the same backing file) may have appended chunks since this
+        instance last looked. Without it, the next ``append`` would
+        ``_set_entry`` at a logical id that's already taken on disk and
+        ``_bump_count`` from a stale value, corrupting the table.
+        """
+        self._chunks = self._read_chain(self._storage, self._chunks[0].offset)
 
     # -------- public API --------
 

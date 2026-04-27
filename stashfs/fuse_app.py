@@ -114,6 +114,14 @@ class Stash(fuse.Fuse):
 
     def getattr(self, path: str):
         if time.time() - self._ctime > self._args.ttl:
+            # Flush any deferred index commit before letting the
+            # filesystem unmount, otherwise writes that arrived
+            # without a closing ``flush(2)`` (e.g. a process killed
+            # mid-copy) would be silently dropped on the way out.
+            try:
+                self.volume.flush()
+            except Exception:
+                log.exception('flush before auto-unmount')
             call_fuse_exit(self.mountpoint)
             return -errno.ENOENT
 
@@ -284,6 +292,42 @@ class Stash(fuse.Fuse):
             return 0
         except Exception:
             log.exception('truncate')
+            return -errno.EIO
+
+    def flush(self, path: str) -> int:
+        """Persist deferred file-index updates on close(2).
+
+        ``Volume.write_file`` only mutates in-memory state and queues
+        chunks for mark-dead; the actual file-index rewrite + slot
+        wrap commit happen here. ``cp`` (and any other userland
+        writer) calls ``close(2)`` at the end of a copy, which the
+        kernel forwards to FUSE as ``flush``, so this is the natural
+        commit point.
+        """
+        self._ctime = time.time()
+        try:
+            self.volume.flush()
+            return 0
+        except Exception:
+            log.exception('flush')
+            return -errno.EIO
+
+    def fsync(self, path: str, isfsyncfile: int) -> int:
+        self._ctime = time.time()
+        try:
+            self.volume.flush()
+            return 0
+        except Exception:
+            log.exception('fsync')
+            return -errno.EIO
+
+    def release(self, path: str, flags: int) -> int:
+        self._ctime = time.time()
+        try:
+            self.volume.flush()
+            return 0
+        except Exception:
+            log.exception('release')
             return -errno.EIO
 
     def chmod(self, path: str, mode: int) -> int:

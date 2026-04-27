@@ -176,6 +176,18 @@ class Container:
     def mark_chunk_dead(self, logical_id: int) -> None:
         self._allocation.mark_dead(logical_id)
 
+    def reload_allocation(self) -> None:
+        """Refresh the in-memory alloc table from disk.
+
+        Multiple ``Volume`` instances may share one backing file —
+        each carries its own ``Container`` and therefore its own
+        ``Allocation``. When a sibling appends chunks, our view goes
+        stale; appending against the stale view would clobber its
+        entries. Volumes call this before a deferred flush to pick up
+        any sibling appends.
+        """
+        self._allocation.reload()
+
     # -------- internals --------
 
     def _check_slot_index(self, index: int) -> None:

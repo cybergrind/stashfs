@@ -61,10 +61,13 @@ class TestVolumeBasic:
         v = Volume(container, kdf, 'alpha')
         assert v.is_associated is False
         v.write_file('a', 0, b'data')
+        v.flush()
         assert v.is_associated is True
 
     def test_reopen_preserves_data(self, container, kdf):
-        Volume(container, kdf, 'alpha').write_file('note', 0, b'persisted')
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('note', 0, b'persisted')
+        v.flush()
         v2 = Volume(container, kdf, 'alpha')
         assert v2.list() == ['note']
         assert v2.read_file('note', 0, 100) == b'persisted'
@@ -108,6 +111,7 @@ class TestUnlink:
     def test_unlink_last_file_frees_slot(self, container, kdf):
         v = Volume(container, kdf, 'alpha')
         v.write_file('only', 0, b'x')
+        v.flush()
         assert v.is_associated is True
         v.unlink('only')
         assert v.is_associated is False
@@ -146,6 +150,7 @@ class TestLargeFileIndex:
         payload = bytes(((i * 2654435761) & 0xFF) for i in range(600 * CHUNK_PAYLOAD_SIZE))
         v = Volume(container, kdf, 'alpha')
         v.write_file('big', 0, payload)
+        v.flush()
         # In-process read.
         assert v.read_file('big', 0, len(payload)) == payload
 
@@ -159,6 +164,7 @@ class TestLargeFileIndex:
         # Many small files - stresses the index breadth rather than depth.
         for i in range(300):
             v.write_file(f'f_{i:04d}.bin', 0, f'payload-{i}'.encode() * 100)
+        v.flush()
 
         v2 = Volume(container, kdf, 'alpha')
         assert len(v2.list()) == 300
@@ -247,10 +253,15 @@ class TestMultiVolumeOnSameContainer:
         assert b.read_file('file-b', 0, 100) == b'beta-data'
 
     def test_reopen_each_after_many_writes(self, container, kdf):
-        Volume(container, kdf, 'alpha').write_file('a', 0, b'AAA')
-        Volume(container, kdf, 'beta').write_file('b', 0, b'BBB')
-        Volume(container, kdf, 'alpha').write_file('a', 3, b'alpha2')
-        Volume(container, kdf, 'beta').write_file('b', 3, b'beta2')
+        for pw, off, payload in [
+            ('alpha', 0, b'AAA'),
+            ('beta', 0, b'BBB'),
+            ('alpha', 3, b'alpha2'),
+            ('beta', 3, b'beta2'),
+        ]:
+            v = Volume(container, kdf, pw)
+            v.write_file('a' if pw == 'alpha' else 'b', off, payload)
+            v.flush()
         v_a = Volume(container, kdf, 'alpha')
         v_b = Volume(container, kdf, 'beta')
         assert v_a.read_file('a', 0, 100) == b'AAAalpha2'
@@ -260,7 +271,9 @@ class TestMultiVolumeOnSameContainer:
 
     def test_unknown_password_all_slots_full_raises(self, container, kdf):
         for p in (f'pw-{i}' for i in range(1, N_SLOTS)):
-            Volume(container, kdf, p).write_file('f', 0, b'x')
+            v = Volume(container, kdf, p)
+            v.write_file('f', 0, b'x')
+            v.flush()
         with pytest.raises(PasswordDoesNotMatch):
             Volume(container, kdf, 'stranger')
 
@@ -269,9 +282,12 @@ class TestCrashSafety:
     def test_slot_unchanged_when_write_blows_up_mid_chunk(self, container, kdf, monkeypatch):
         v = Volume(container, kdf, 'alpha')
         v.write_file('a', 0, b'initial')
+        v.flush()
         slot_before = container.read_slot(v.slot_index)
 
-        # Simulate a mid-write failure: raise before the slot is updated.
+        # Simulate a mid-commit failure: ``write_file`` appends fresh
+        # data chunks fine, but the index-chain rewrite during the
+        # ``flush()`` blows up before the slot wrap is updated.
         original_append = container.append_chunk
         call_count = {'n': 0}
 
@@ -283,8 +299,12 @@ class TestCrashSafety:
 
         monkeypatch.setattr(container, 'append_chunk', boom)
 
-        with pytest.raises(KeyboardInterrupt):
+        def overwrite_then_flush():
             v.write_file('a', 0, b'NEW')
+            v.flush()
+
+        with pytest.raises(KeyboardInterrupt):
+            overwrite_then_flush()
 
         slot_after = container.read_slot(v.slot_index)
         assert slot_before == slot_after
@@ -410,9 +430,11 @@ class TestMarkDeadAtCommit:
         """Rewriting the same file N times must not grow the live-chunk count."""
         v = Volume(container, kdf, 'alpha')
         v.write_file('f', 0, b'first')
+        v.flush()
         baseline = container.num_chunks()
         for i in range(10):
             v.write_file('f', 0, f'round-{i}'.encode())
+            v.flush()
         # Same file, same logical layout -> same live-chunk count.
         assert container.num_chunks() == baseline
 
@@ -420,9 +442,11 @@ class TestMarkDeadAtCommit:
         v = Volume(container, kdf, 'alpha')
         # 3 chunks of data.
         v.write_file('f', 0, b'x' * (CHUNK_PAYLOAD_SIZE * 3))
+        v.flush()
         before = container.num_chunks()
         # Drop to 1 chunk worth; two chunks' worth of data must die.
         v.truncate('f', CHUNK_PAYLOAD_SIZE)
+        v.flush()
         after = container.num_chunks()
         assert after < before
         # File still reads back correctly.
@@ -431,6 +455,7 @@ class TestMarkDeadAtCommit:
     def test_unlink_last_file_drops_live_count_to_zero(self, container, kdf):
         v = Volume(container, kdf, 'alpha')
         v.write_file('f', 0, b'payload' * 1000)
+        v.flush()
         assert container.num_chunks() > 0
         v.unlink('f')
         assert container.num_chunks() == 0
@@ -439,14 +464,52 @@ class TestMarkDeadAtCommit:
         v = Volume(container, kdf, 'alpha')
         v.write_file('keeper', 0, b'keepme')
         v.write_file('victim', 0, b'x' * (CHUNK_PAYLOAD_SIZE * 2))
+        v.flush()
         baseline = container.num_chunks()
         v.unlink('victim')
         # Victim's 2 data chunks + at least the old index chain chunks are dead.
         assert container.num_chunks() < baseline
         assert v.read_file('keeper', 0, 6) == b'keepme'
 
+    def test_sequential_writes_dont_amplify(self, container, kdf):
+        """Sequential FUSE-style writes must not blow up the backing file.
+
+        Reproduces a user report: copying a 200 MB file produced a
+        ~10 GB backing file and kept growing. Two compounding bugs
+        were responsible:
+
+        1. ``write_file`` rewrote the *entire* file-index chain on
+           every call. Since the index size is linear in the chunk
+           count, this gave O(N²) write amplification.
+        2. Extending a file pre-filled each new chunk position with a
+           zero chunk and then immediately rewrote it with the actual
+           payload, doubling the per-write data work.
+
+        After the fix, ``write_file`` only mutates in-memory state
+        (plus the data chunk for ``buf``); the index commit is
+        deferred to ``flush()``. The total physical-chunk count for a
+        sequential append should be linear in the data size.
+        """
+        v = Volume(container, kdf, 'alpha')
+        pt = CHUNK_PAYLOAD_SIZE
+        n_writes = 256
+        for i in range(n_writes):
+            v.write_file('big', i * pt, b'X' * pt)
+        v.flush()
+        # 256 data chunks + a small index chain. The unfixed code
+        # produced ~256 zero pre-fills + 256 superseded data chunks +
+        # ~Σ(N=1..256) index chunks = well over 700.
+        physical = container._allocation.next_logical_id
+        assert physical < 350, (
+            f'expected near-linear allocation, got {physical} physical chunks for {n_writes} data chunks of payload'
+        )
+        # Sanity: data is intact end-to-end.
+        assert v.read_file('big', 0, n_writes * pt) == b'X' * (n_writes * pt)
+
     def test_plaintext_not_in_container(self, container, kdf):
-        Volume(container, kdf, 'alpha').write_file('note', 0, b'secret-payload-xyz')
+        v = Volume(container, kdf, 'alpha')
+        v.write_file('note', 0, b'secret-payload-xyz')
+        v.flush()
         disk_bytes = container.storage.read(container.storage.size(), 0)
         assert b'secret-payload-xyz' not in disk_bytes
         assert b'note' not in disk_bytes

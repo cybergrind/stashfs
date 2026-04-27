@@ -70,6 +70,12 @@ def make_stash(backing_file, fast_kdf):
         stash.add_args(FakeArgs(fname=path), password=pw, kdf=fast_kdf)
 
         def reopen(new_password: str | None = None) -> Stash:
+            # Mirror what real FUSE close(2) -> flush would do for a
+            # userland writer. Without this, every test that wrote
+            # through the first Stash and then re-opens to assert
+            # persistence would see the deferred index commit
+            # disappear.
+            stash.volume.flush()
             new_fly = Stash()
             new_fly.add_args(
                 FakeArgs(fname=path),
@@ -101,6 +107,14 @@ class MultiStash:
         self._live: list[Stash] = []
 
     def mount(self, password: str = '') -> Stash:
+        # Flush every volume that's already live so their deferred
+        # index commits land on disk before a new volume opens its
+        # own (read-only-at-construction) view of the allocation
+        # chain. Without this, a later flush from a stale-view volume
+        # would write allocation entries based on outdated state and
+        # collide with appends from sibling volumes.
+        for live in self._live:
+            live.volume.flush()
         stash = Stash()
         stash.add_args(FakeArgs(fname=self.path), password=password, kdf=self.kdf)
         self._live.append(stash)
@@ -108,6 +122,12 @@ class MultiStash:
 
     def unmount_all(self) -> None:
         for stash in self._live:
+            # Flush any deferred index commit before tearing down the
+            # underlying file handles. Without this, writes that the
+            # test made without going through Stash's FUSE-level
+            # flush/release callbacks would be silently dropped at
+            # remount time.
+            stash.volume.flush()
             handle = getattr(stash.storage, 'read_handle', None)
             if handle is not None and not handle.closed:
                 handle.close()

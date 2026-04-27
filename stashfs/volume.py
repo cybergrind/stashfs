@@ -106,6 +106,16 @@ class Volume:
         # We remember them so we can mark-dead the chain when it's
         # superseded on the next commit.
         self._index_chain_ids: list[int] = []
+        # Batched-commit state: data chunks are appended eagerly, but the
+        # file-index rewrite + slot wrap update are deferred until
+        # ``flush()``. Without this, every FUSE write rewrote the entire
+        # (linearly growing) index chain — causing O(N²) write
+        # amplification on large copies. ``_pending_dead`` collects
+        # chunk ids that became unreachable between commits; they get
+        # marked dead only after the slot wrap commits, so a crash
+        # before flush leaves the previous state intact.
+        self._dirty: bool = False
+        self._pending_dead: list[int] = []
         if self._slot.file_table_chunk_id is not None:
             self._load_file_index()
 
@@ -152,7 +162,8 @@ class Volume:
         if not self.is_dir(parent):
             raise FileNotFoundError(parent)
         self._dirs.add(name)
-        self._persist_file_index()
+        self._dirty = True
+        self.flush()
 
     def rmdir(self, name: str) -> None:
         """Remove an empty directory.
@@ -172,7 +183,8 @@ class Volume:
         if has_child:
             raise OSError(_errno.ENOTEMPTY, f'directory not empty: {name!r}')
         self._dirs.discard(name)
-        self._persist_file_index()
+        self._dirty = True
+        self.flush()
 
     def iter_children(self, parent: str) -> Iterator[tuple[str, str]]:
         """Yield ``(basename, kind)`` for direct children of ``parent``.
@@ -245,40 +257,61 @@ class Volume:
 
         end = offset + len(buf)
         pt = CHUNK_PAYLOAD_SIZE
-        # Grow chunk list to cover the end position (even if writing a
-        # zero-length buffer at a new position).
         last_needed_chunk = (max(end, file.size + 1) - 1) // pt if max(end, file.size) > 0 else -1
-        while len(file.chunk_ids) <= last_needed_chunk:
-            file.chunk_ids.append(self._append_plaintext(b'\x00' * pt))
+        old_count = len(file.chunk_ids)
 
+        if buf:
+            first_write = offset // pt
+            last_write = (end - 1) // pt
+        else:
+            first_write = 1
+            last_write = 0  # empty range
+
+        # Phase 1: extend chunk_ids past ``old_count``. For new chunks
+        # that fall inside ``[first_write, last_write]`` we build their
+        # content directly from ``buf`` and skip the historic
+        # append-zeros-then-immediately-rewrite double-write. For
+        # sparse-hole positions (past EOF, before the write range) we
+        # still need a real zero chunk on disk.
+        for idx in range(old_count, last_needed_chunk + 1):
+            cs = idx * pt
+            ce = cs + pt
+            if first_write <= idx <= last_write:
+                ws = max(offset, cs)
+                we = min(end, ce)
+                if ws == cs and we == ce:
+                    payload = buf[ws - offset : we - offset]
+                else:
+                    chunk = bytearray(b'\x00' * pt)
+                    chunk[ws - cs : we - cs] = buf[ws - offset : we - offset]
+                    payload = bytes(chunk)
+                file.chunk_ids.append(self._append_plaintext(payload))
+            else:
+                file.chunk_ids.append(self._append_plaintext(b'\x00' * pt))
+
+        # Phase 2: existing chunks that overlap the write range get a
+        # read-modify-write. Full-chunk overwrites skip the read.
         superseded: list[int] = []
         if buf:
-            first_chunk = offset // pt
-            last_chunk = (end - 1) // pt
-            for chunk_idx in range(first_chunk, last_chunk + 1):
-                current = bytearray(self._decrypt_chunk(file.chunk_ids[chunk_idx]))
-                if len(current) < pt:
-                    current.extend(b'\x00' * (pt - len(current)))
-                chunk_start = chunk_idx * pt
-                write_start = max(offset, chunk_start)
-                write_end = min(end, chunk_start + pt)
-                src_start = write_start - offset
-                src_end = write_end - offset
-                dst_start = write_start - chunk_start
-                dst_end = write_end - chunk_start
-                current[dst_start:dst_end] = buf[src_start:src_end]
-                superseded.append(file.chunk_ids[chunk_idx])
-                file.chunk_ids[chunk_idx] = self._append_plaintext(bytes(current))
+            for idx in range(first_write, min(last_write, old_count - 1) + 1):
+                cs = idx * pt
+                ce = cs + pt
+                ws = max(offset, cs)
+                we = min(end, ce)
+                if ws == cs and we == ce:
+                    payload = buf[ws - offset : we - offset]
+                else:
+                    cur = bytearray(self._decrypt_chunk(file.chunk_ids[idx]))
+                    if len(cur) < pt:
+                        cur.extend(b'\x00' * (pt - len(cur)))
+                    cur[ws - cs : we - cs] = buf[ws - offset : we - offset]
+                    payload = bytes(cur)
+                superseded.append(file.chunk_ids[idx])
+                file.chunk_ids[idx] = self._append_plaintext(payload)
 
         file.size = max(file.size, end)
-        self._persist_file_index()
-        # Mark superseded chunks dead only after the slot wrap commit.
-        # A crash between the append and this point leaves the old
-        # chunks marked live; optimize will miss them but data
-        # integrity is preserved (the old slot points at the old chain
-        # which still references the old chunks).
-        for cid in superseded:
-            self.container.mark_chunk_dead(cid)
+        self._dirty = True
+        self._pending_dead.extend(superseded)
         return len(buf)
 
     def truncate(self, name: str, size: int) -> None:
@@ -293,9 +326,8 @@ class Volume:
             dropped = list(file.chunk_ids)
             file.chunk_ids = []
             file.size = 0
-            self._persist_file_index()
-            for cid in dropped:
-                self.container.mark_chunk_dead(cid)
+            self._dirty = True
+            self._pending_dead.extend(dropped)
             return
 
         needed_chunks = (size + pt - 1) // pt
@@ -316,12 +348,11 @@ class Volume:
             for i in range(tail_end, pt):
                 current[i] = 0
             file.chunk_ids[-1] = self._append_plaintext(bytes(current))
-            self.container.mark_chunk_dead(last_cid)
+            self._pending_dead.append(last_cid)
 
         file.size = size
-        self._persist_file_index()
-        for cid in dropped:
-            self.container.mark_chunk_dead(cid)
+        self._dirty = True
+        self._pending_dead.extend(dropped)
 
     def rename(self, old: str, new: str) -> None:
         """Rename ``old`` to ``new`` within this volume.
@@ -345,12 +376,14 @@ class Volume:
         if old in self._files:
             entry = self._files.pop(old)
             self._files[new] = VolumeFile(name=new, size=entry.size, chunk_ids=entry.chunk_ids)
-            self._persist_file_index()
+            self._dirty = True
+            self.flush()
             return
 
         if self.is_dir(old):
             self._rename_subtree(old, new)
-            self._persist_file_index()
+            self._dirty = True
+            self.flush()
             return
 
         raise KeyError(old)
@@ -387,11 +420,17 @@ class Volume:
                 self.slot_table.free(self._slot.index)
                 # Every chunk this volume ever wrote under the old key
                 # is now unreachable (we're about to rotate the key).
-                # Mark them all dead so optimize can reclaim them.
+                # Mark them all dead so optimize can reclaim them —
+                # including any pending-dead chunks queued by deferred
+                # writes that hadn't been committed yet.
                 for cid in victim.chunk_ids:
                     self.container.mark_chunk_dead(cid)
                 for cid in self._index_chain_ids:
                     self.container.mark_chunk_dead(cid)
+                for cid in self._pending_dead:
+                    self.container.mark_chunk_dead(cid)
+                self._pending_dead = []
+                self._dirty = False
                 self._index_chain_ids = []
                 self._slot = SlotInfo(
                     index=self._slot.index,
@@ -404,9 +443,34 @@ class Volume:
                 # orphaned ciphertexts on disk).
                 self._cipher = AEADChunk(self._slot.volume_key)
         else:
+            self._pending_dead.extend(victim.chunk_ids)
+            self._dirty = True
+            self.flush()
+
+    def flush(self) -> None:
+        """Commit pending in-memory state to the backing container.
+
+        Persists the file-index chain (rewriting it once per call,
+        regardless of how many ``write_file`` / ``truncate`` calls
+        produced the dirty state) and only then marks every queued
+        superseded chunk dead. The order matters: until the slot wrap
+        points at the new index chain, the OLD chain is the source of
+        truth, so the chunks it references must remain live.
+        """
+        if not self._dirty and not self._pending_dead:
+            return
+        # Reload the allocation chain in case a sibling Volume on the
+        # same backing file appended chunks since we last did. Without
+        # this, our cached chunk count is stale and the next
+        # ``append`` would clobber another volume's entries.
+        self.container.reload_allocation()
+        if self._dirty:
             self._persist_file_index()
-            for cid in victim.chunk_ids:
+            self._dirty = False
+        if self._pending_dead:
+            for cid in self._pending_dead:
                 self.container.mark_chunk_dead(cid)
+            self._pending_dead = []
 
     def _load_file_index(self) -> None:
         assert self._slot.file_table_chunk_id is not None

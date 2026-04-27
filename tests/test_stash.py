@@ -129,14 +129,17 @@ class TestBasicFly:
         # Empty password -> slot 0.
         fly_empty = mount('')
         fly_empty.write('/public.txt', b'no-password-needed', 0)
+        fly_empty.volume.flush()
         assert fly_empty.volume.slot_index == 0
 
         fly_a = mount('alpha')
         fly_a.write('/a.txt', b'alpha-secret', 0)
+        fly_a.volume.flush()
         assert fly_a.volume.slot_index == 1
 
         fly_b = mount('beta')
         fly_b.write('/b.txt', b'beta-secret', 0)
+        fly_b.volume.flush()
         assert fly_b.volume.slot_index == 2
 
         # Remounts see only their own volume's files, with data intact.
@@ -152,6 +155,7 @@ class TestBasicFly:
         assert fly_c.volume.slot_index == 3
         assert fly_c.volume.list() == []
         fly_c.write('/c.txt', b'gamma-secret', 0)
+        fly_c.volume.flush()
         assert mount('gamma').read('/c.txt', 100, 0) == b'gamma-secret'
 
         # None of the plaintext leaks onto the raw backing file.
@@ -192,6 +196,7 @@ class TestCoverFile:
         stash = Stash()
         stash.add_args(FakeArgs(fname=path), password='', kdf=fast_kdf)
         stash.write('/hidden.txt', b'only-inside-the-container', 0)
+        stash.volume.flush()
 
         on_disk = path.read_bytes()
         assert on_disk[: len(cover)] == cover, 'cover bytes were not preserved'
@@ -210,8 +215,12 @@ class TestCoverFile:
             f.add_args(FakeArgs(fname=path), password=pw, kdf=fast_kdf)
             return f
 
-        mount('').write('/a.txt', b'empty-pw-data', 0)
-        mount('alpha').write('/b.txt', b'alpha-data', 0)
+        empty = mount('')
+        empty.write('/a.txt', b'empty-pw-data', 0)
+        empty.volume.flush()
+        alpha = mount('alpha')
+        alpha.write('/b.txt', b'alpha-data', 0)
+        alpha.volume.flush()
 
         assert mount('').read('/a.txt', 100, 0) == b'empty-pw-data'
         assert mount('alpha').read('/b.txt', 100, 0) == b'alpha-data'

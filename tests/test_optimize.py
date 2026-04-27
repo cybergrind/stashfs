@@ -92,6 +92,7 @@ class TestOptimizePreservesCover:
         assert alpha.write('/payload', b'Z' * 5000, 0) == 5000
         assert alpha.unlink('/payload') == 0
         assert alpha.write('/kept', b'keepme', 0) == 6
+        alpha.volume.flush()
         alpha.storage.read_handle.close()
         del alpha
         import gc
