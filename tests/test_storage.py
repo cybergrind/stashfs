@@ -160,3 +160,60 @@ class TestCoverStorageSpecifics:
         path.write_bytes(b'x' * 10 + CoverStorage.FOOTER_MAGIC + (10**9).to_bytes(8, 'big'))
         with pytest.raises(ValueError, match='cover_length'):
             CoverStorage.attach(FileWrapper(path))
+
+
+class TestFileWrapperThreadSafety:
+    """``FileWrapper.read`` must be safe under concurrent callers.
+
+    fuse-python defaults to multithreaded mode, so the FUSE daemon
+    receives concurrent ``read`` calls on the same backing file. The
+    original implementation did ``handle.seek(); handle.read()`` on a
+    shared file handle — when two threads interleaved the seek and the
+    read, one's seek won and both reads came back from the same offset,
+    producing scrambled byte runs in large reads (visible as H.264
+    decoder errors during video playback). The fix is ``os.pread``,
+    which carries the offset in the syscall and is atomic per call.
+    """
+
+    def test_concurrent_reads_return_correct_bytes(self, tmp_path):
+        import hashlib
+        import threading
+
+        # 16 distinct 4 KiB blocks. Each is filled with the byte equal
+        # to its block index, so a concurrent caller getting the wrong
+        # block sees uniformly-wrong content (no false positives from
+        # partial overlap).
+        block = 4096
+        n_blocks = 16
+        path = tmp_path / 'b'
+        path.write_bytes(b''.join(bytes([i]) * block for i in range(n_blocks)))
+        fw = FileWrapper(path)
+
+        expected_hash = {i: hashlib.md5(bytes([i]) * block).hexdigest() for i in range(n_blocks)}
+
+        # 8 threads, each reads every block 50 times in random order.
+        # Without ``pread`` this reliably produces mismatches within
+        # a few hundred reads.
+        import random
+
+        rng = random.Random(0)
+        order = [(rng.randrange(n_blocks), rng.randrange(50)) for _ in range(8 * n_blocks * 50)]
+        bad: list[str] = []
+        bad_lock = threading.Lock()
+
+        def worker(slice_):
+            for idx, _ in slice_:
+                got = fw.read(block, idx * block)
+                h = hashlib.md5(got).hexdigest()
+                if h != expected_hash[idx]:
+                    with bad_lock:
+                        bad.append(f'block {idx}: got {h}, expected {expected_hash[idx]}')
+
+        chunks = [order[i::8] for i in range(8)]
+        threads = [threading.Thread(target=worker, args=(c,)) for c in chunks]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not bad, bad[:5]

@@ -513,3 +513,121 @@ class TestMarkDeadAtCommit:
         disk_bytes = container.storage.read(container.storage.size(), 0)
         assert b'secret-payload-xyz' not in disk_bytes
         assert b'note' not in disk_bytes
+
+
+class TestVolumeConcurrency:
+    """``Volume`` must tolerate FUSE multithreaded delivery.
+
+    fuse-python's default mode dispatches reads and writes from a
+    worker pool, so user-visible ``Volume`` calls can land on
+    different threads against one backing file. Mutations are
+    serialised by ``Volume._write_lock``; reads stay lock-free and
+    rely on ``os.pread`` plus monotonically-extended chunk_id lists.
+    """
+
+    def test_concurrent_writes_to_distinct_files_all_persist(self, container, kdf):
+        """N threads each write their own file; every payload round-trips.
+
+        Without the write lock, two appends would race on the
+        ``Allocation`` tail (``_set_entry`` + ``_bump_count`` are
+        not atomic), reusing physical slots and corrupting one
+        another's data.
+        """
+        import threading
+
+        v = Volume(container, kdf, 'alpha')
+        # Each file has unique content keyed to its index so a
+        # cross-write would surface as a content mismatch.
+        n = 8
+        payloads = {i: f'thread-{i}-content-'.encode() * 200 for i in range(n)}
+
+        def worker(i: int) -> None:
+            v.write_file(f'f{i}', 0, payloads[i])
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        v.flush()
+
+        for i in range(n):
+            got = v.read_file(f'f{i}', 0, len(payloads[i]))
+            assert got == payloads[i], f'f{i} corrupt'
+
+    def test_concurrent_reads_of_same_file_match(self, container, kdf):
+        """N threads each hash a multi-chunk file; every hash matches.
+
+        ``Volume.read_file`` is lock-free and goes through
+        ``os.pread`` — concurrent readers must see identical bytes.
+        """
+        import hashlib
+        import threading
+
+        v = Volume(container, kdf, 'alpha')
+        # Multi-chunk payload (>4 chunks) so each read decrypts
+        # several chunks and exercises the per-chunk loop in
+        # ``read_file`` under contention.
+        payload = bytes(((i * 2654435761) & 0xFF) for i in range(5 * CHUNK_PAYLOAD_SIZE))
+        v.write_file('big', 0, payload)
+        v.flush()
+        canonical = hashlib.md5(payload).hexdigest()
+
+        results: list[str] = []
+        lock = threading.Lock()
+
+        def worker():
+            got = v.read_file('big', 0, len(payload))
+            h = hashlib.md5(got).hexdigest()
+            with lock:
+                results.append(h)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert results == [canonical] * 8
+
+    def test_reads_during_writes_never_see_torn_data(self, container, kdf):
+        """A reader hitting an existing file while another thread is
+        appending a *different* file must never see torn bytes.
+
+        The risk is the writer mutating ``Allocation`` tail state
+        ( ``_chunks[-1].count`` / ``entries`` / a chunk-chain
+        extension ) while the reader walks the table for a chunk in
+        an earlier alloc-chunk slot. The append path appends past
+        EOF, so existing chunks' physical slots never move; this
+        test pins down that invariant.
+        """
+        import threading
+
+        v = Volume(container, kdf, 'alpha')
+        existing = bytes(((i * 2654435761) & 0xFF) for i in range(3 * CHUNK_PAYLOAD_SIZE))
+        v.write_file('reader-target', 0, existing)
+        v.flush()
+
+        stop = threading.Event()
+        bad: list[str] = []
+        bad_lock = threading.Lock()
+
+        def reader():
+            while not stop.is_set():
+                got = v.read_file('reader-target', 0, len(existing))
+                if got != existing:
+                    with bad_lock:
+                        bad.append('mismatch')
+                    return
+
+        def writer():
+            for i in range(20):
+                v.write_file(f'writer-{i}', 0, f'payload-{i}'.encode() * 500)
+
+        r = threading.Thread(target=reader)
+        w = threading.Thread(target=writer)
+        r.start()
+        w.start()
+        w.join()
+        stop.set()
+        r.join()
+        assert not bad

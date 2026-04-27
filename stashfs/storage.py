@@ -115,21 +115,28 @@ class FileWrapper:
 
     def write(self, offset: int, buf: bytes) -> None:
         log.debug(f'write {offset=} {len(buf)=}')
+        # ``os.pwrite`` is atomic on the FD: no seek state to race on,
+        # and Linux serialises positional writes against concurrent
+        # ``pread`` calls on the same inode through the page cache.
+        # That's what lets us run the FUSE daemon multithreaded
+        # without the seek-then-write/read pattern producing scrambled
+        # bytes (see the ``read`` docstring).
         with self.path.open('r+b') as f:
-            f.seek(offset, os.SEEK_SET)
-            f.write(buf)
-        self.reset_handlers()
+            os.pwrite(f.fileno(), buf, offset)
 
     def write_end(self, buf: bytes) -> None:
         with self.path.open('r+b') as f:
-            f.seek(0, os.SEEK_END)
-            f.write(buf)
-        self.reset_handlers()
+            os.pwrite(f.fileno(), buf, self.path.stat().st_size)
 
     def read(self, size: int, offset: int) -> bytes:
-        log.debug(f'read {offset=} {size=}')
-        self.read_handle.seek(offset, os.SEEK_SET)
-        return self.read_handle.read(size)
+        # ``os.pread`` is the only thread-safe way to read at an
+        # offset: a ``seek`` followed by ``read`` lets sibling threads
+        # interleave the seek and clobber the read position. Symptom:
+        # large multi-block reads return correct bytes but with
+        # 8-/16-byte runs swapped between concurrent reads — H.264
+        # decoders see "Invalid NAL unit size" garbage and conceal
+        # frames. ``pread`` carries the offset in the syscall itself.
+        return os.pread(self.read_handle.fileno(), size, offset)
 
     def size(self) -> int:
         return self.path.stat().st_size
@@ -137,7 +144,6 @@ class FileWrapper:
     def truncate(self, size: int) -> None:
         with self.path.open('r+b') as f:
             f.truncate(size)
-        self.reset_handlers()
 
 
 class CoverStorage:

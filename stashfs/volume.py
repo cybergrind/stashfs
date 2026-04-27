@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import struct
+import threading
 from collections.abc import Iterator
 
 from stashfs.container import CHUNK_PAYLOAD_SIZE, Container
@@ -116,6 +117,19 @@ class Volume:
         # before flush leaves the previous state intact.
         self._dirty: bool = False
         self._pending_dead: list[int] = []
+        # Mutating operations (write_file/truncate/mkdir/.../flush) all
+        # touch the in-memory file index, the per-volume cipher state,
+        # and — through ``Container.append_chunk`` — the shared
+        # ``Allocation`` table. The allocation chain in particular is
+        # not safe to mutate concurrently: ``_set_entry`` and
+        # ``_bump_count`` write to fixed disk offsets without locking,
+        # so two concurrent appends would clobber each other and the
+        # backing file would diverge from the in-memory ``_chunks``.
+        # FUSE multithreaded mode happily delivers concurrent writes
+        # to one inode, so we serialize them here. Reads stay
+        # lock-free (storage I/O is atomic via ``os.pread``; chunk-id
+        # lookups read immutable past entries).
+        self._write_lock = threading.Lock()
         if self._slot.file_table_chunk_id is not None:
             self._load_file_index()
 
@@ -152,18 +166,19 @@ class Volume:
 
     def mkdir(self, name: str) -> None:
         """Register an explicit empty directory at ``name``."""
-        if name == '':
-            raise FileExistsError('')
-        if name in self._files:
-            raise FileExistsError(name)
-        if self.is_dir(name):
-            raise FileExistsError(name)
-        parent = _parent_of(name)
-        if not self.is_dir(parent):
-            raise FileNotFoundError(parent)
-        self._dirs.add(name)
-        self._dirty = True
-        self.flush()
+        with self._write_lock:
+            if name == '':
+                raise FileExistsError('')
+            if name in self._files:
+                raise FileExistsError(name)
+            if self.is_dir(name):
+                raise FileExistsError(name)
+            parent = _parent_of(name)
+            if not self.is_dir(parent):
+                raise FileNotFoundError(parent)
+            self._dirs.add(name)
+            self._dirty = True
+            self._flush_locked()
 
     def rmdir(self, name: str) -> None:
         """Remove an empty directory.
@@ -174,17 +189,18 @@ class Volume:
         """
         import errno as _errno
 
-        if not self.is_dir(name):
-            raise KeyError(name)
-        prefix = name + '/' if name else ''
-        has_child = any(f.startswith(prefix) for f in self._files) or any(
-            d.startswith(prefix) and d != name for d in self._dirs
-        )
-        if has_child:
-            raise OSError(_errno.ENOTEMPTY, f'directory not empty: {name!r}')
-        self._dirs.discard(name)
-        self._dirty = True
-        self.flush()
+        with self._write_lock:
+            if not self.is_dir(name):
+                raise KeyError(name)
+            prefix = name + '/' if name else ''
+            has_child = any(f.startswith(prefix) for f in self._files) or any(
+                d.startswith(prefix) and d != name for d in self._dirs
+            )
+            if has_child:
+                raise OSError(_errno.ENOTEMPTY, f'directory not empty: {name!r}')
+            self._dirs.discard(name)
+            self._dirty = True
+            self._flush_locked()
 
     def iter_children(self, parent: str) -> Iterator[tuple[str, str]]:
         """Yield ``(basename, kind)`` for direct children of ``parent``.
@@ -250,6 +266,10 @@ class Volume:
     def write_file(self, name: str, offset: int, buf: bytes) -> int:
         if offset < 0:
             raise ValueError('offset must be non-negative')
+        with self._write_lock:
+            return self._write_file_locked(name, offset, buf)
+
+    def _write_file_locked(self, name: str, offset: int, buf: bytes) -> int:
         file = self._files.get(name)
         if file is None:
             file = VolumeFile(name=name)
@@ -315,11 +335,15 @@ class Volume:
         return len(buf)
 
     def truncate(self, name: str, size: int) -> None:
+        if size < 0:
+            raise ValueError('size must be non-negative')
+        with self._write_lock:
+            self._truncate_locked(name, size)
+
+    def _truncate_locked(self, name: str, size: int) -> None:
         file = self._files.get(name)
         if file is None:
             raise KeyError(name)
-        if size < 0:
-            raise ValueError('size must be non-negative')
         pt = CHUNK_PAYLOAD_SIZE
 
         if size == 0:
@@ -365,28 +389,29 @@ class Volume:
         Overwrites ``new`` if it already exists as a file with the
         same role (file → file). Renaming to the same name is a no-op.
         """
-        if old == new:
-            if old not in self._files and not self.is_dir(old):
-                raise KeyError(old)
-            return
-        new_parent = _parent_of(new)
-        if not self.is_dir(new_parent):
-            raise FileNotFoundError(new_parent)
+        with self._write_lock:
+            if old == new:
+                if old not in self._files and not self.is_dir(old):
+                    raise KeyError(old)
+                return
+            new_parent = _parent_of(new)
+            if not self.is_dir(new_parent):
+                raise FileNotFoundError(new_parent)
 
-        if old in self._files:
-            entry = self._files.pop(old)
-            self._files[new] = VolumeFile(name=new, size=entry.size, chunk_ids=entry.chunk_ids)
-            self._dirty = True
-            self.flush()
-            return
+            if old in self._files:
+                entry = self._files.pop(old)
+                self._files[new] = VolumeFile(name=new, size=entry.size, chunk_ids=entry.chunk_ids)
+                self._dirty = True
+                self._flush_locked()
+                return
 
-        if self.is_dir(old):
-            self._rename_subtree(old, new)
-            self._dirty = True
-            self.flush()
-            return
+            if self.is_dir(old):
+                self._rename_subtree(old, new)
+                self._dirty = True
+                self._flush_locked()
+                return
 
-        raise KeyError(old)
+            raise KeyError(old)
 
     def _rename_subtree(self, old: str, new: str) -> None:
         """Rewrite every ``_files`` and ``_dirs`` entry under ``old/`` to ``new/``."""
@@ -412,6 +437,10 @@ class Volume:
             self._dirs.add(dst)
 
     def unlink(self, name: str) -> None:
+        with self._write_lock:
+            self._unlink_locked(name)
+
+    def _unlink_locked(self, name: str) -> None:
         if name not in self._files:
             raise KeyError(name)
         victim = self._files.pop(name)
@@ -445,7 +474,7 @@ class Volume:
         else:
             self._pending_dead.extend(victim.chunk_ids)
             self._dirty = True
-            self.flush()
+            self._flush_locked()
 
     def flush(self) -> None:
         """Commit pending in-memory state to the backing container.
@@ -457,6 +486,10 @@ class Volume:
         points at the new index chain, the OLD chain is the source of
         truth, so the chunks it references must remain live.
         """
+        with self._write_lock:
+            self._flush_locked()
+
+    def _flush_locked(self) -> None:
         if not self._dirty and not self._pending_dead:
             return
         # Reload the allocation chain in case a sibling Volume on the

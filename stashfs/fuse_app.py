@@ -371,14 +371,7 @@ def mount(args, password: str = '') -> None:
     )
     f.add_args(args, password=password)
     f.parser.add_option(mountopt=args.mountpoint, metavar='PATH', default=args.mountpoint)
-    # Force single-threaded mode. fuse-python defaults to multithreaded,
-    # which breaks our ``Storage`` layer: ``FileWrapper.read`` does
-    # ``seek + read`` on a shared file handle, and concurrent calls
-    # interleave the two operations and return data from a sibling
-    # request's offset. The visible symptom was randomly-shuffled
-    # 8-byte runs in large reads (e.g. video playback artifacts).
-    f.multithreaded = False
-    f.main(['stashfs.py', str(args.mountpoint), '-s'])
+    f.main(['stashfs.py', str(args.mountpoint)])
 
 
 def _ensure_mountpoint(mountpoint: Path) -> None:
