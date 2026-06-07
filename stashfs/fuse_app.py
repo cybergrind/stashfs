@@ -413,6 +413,31 @@ def _looks_like_fuse_mount(mountpoint: Path, mounts_path: str = '/proc/mounts') 
     return False
 
 
+STASHFS_FSTYPE_PREFIX = 'fuse.stashfs'
+
+
+def iter_stashfs_mounts(mounts_path: str = '/proc/mounts') -> list[Path]:
+    """Return the mountpoint of every active stashfs FUSE mount.
+
+    stashfs advertises itself in ``/proc/mounts`` with the device name
+    ``stashfs.py`` and fstype ``fuse.stashfs.py`` (the fuse-python
+    program name). We match on the fstype prefix so a future rename of
+    the entry point still resolves, and parse ``/proc/mounts`` directly
+    (kernel state) rather than stat-ing each path, which would hang on a
+    mount whose daemon has died.
+    """
+    mounts: list[Path] = []
+    try:
+        with open(mounts_path, encoding='utf-8') as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 3 and parts[2].startswith(STASHFS_FSTYPE_PREFIX):
+                    mounts.append(Path(parts[1]))
+    except OSError:
+        pass
+    return mounts
+
+
 def _unmount_stale(
     mountpoint: Path,
     runner: Callable[..., Any] = subprocess.run,

@@ -152,6 +152,85 @@ class TestOptimizeCLIPasswordless:
         assert reopened.read('/f', 5, 0) == b'hello'
 
 
+class TestUnmount:
+    """`stashfs unmount` (alias `u`) scans /proc/mounts and `fusermount -u`s
+    every active stashfs mount."""
+
+    SAMPLE_MOUNTS = (
+        'fusectl /sys/fs/fuse/connections fusectl rw 0 0\n'
+        'encfs /home/u/.keys fuse.encfs rw 0 0\n'
+        'stashfs.py /mnt/one fuse.stashfs.py rw,nosuid 0 0\n'
+        'gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw 0 0\n'
+        'stashfs.py /mnt/two fuse.stashfs.py rw,nodev 0 0\n'
+    )
+
+    def test_iter_stashfs_mounts_filters_to_stashfs(self, tmp_path):
+        from pathlib import Path
+
+        from stashfs.fuse_app import iter_stashfs_mounts
+
+        mounts_file = tmp_path / 'mounts'
+        mounts_file.write_text(self.SAMPLE_MOUNTS)
+
+        found = iter_stashfs_mounts(str(mounts_file))
+        assert found == [Path('/mnt/one'), Path('/mnt/two')]
+
+    def test_iter_stashfs_mounts_missing_file_is_empty(self, tmp_path):
+        from stashfs.fuse_app import iter_stashfs_mounts
+
+        assert iter_stashfs_mounts(str(tmp_path / 'nope')) == []
+
+    def test_unmount_runs_fusermount_on_each(self, monkeypatch, capsys):
+        from pathlib import Path
+
+        monkeypatch.setattr(
+            'stashfs.cli.iter_stashfs_mounts',
+            lambda *_a, **_k: [Path('/mnt/one'), Path('/mnt/two')],
+        )
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(cmd)
+            return types.SimpleNamespace(returncode=0, stderr='')
+
+        monkeypatch.setattr('stashfs.cli.subprocess.run', fake_run)
+
+        rc = main(['unmount'])
+        assert rc == 0
+        assert calls == [
+            ['fusermount', '-u', '/mnt/one'],
+            ['fusermount', '-u', '/mnt/two'],
+        ]
+
+    def test_u_alias_dispatches_to_unmount(self, monkeypatch):
+        called = {'n': 0}
+        monkeypatch.setattr('stashfs.cli._run_unmount', lambda args: called.update(n=called['n'] + 1) or 0)
+        rc = main(['u'])
+        assert rc == 0
+        assert called['n'] == 1
+
+    def test_unmount_no_mounts(self, monkeypatch, capsys):
+        monkeypatch.setattr('stashfs.cli.iter_stashfs_mounts', lambda *_a, **_k: [])
+        ran = {'n': 0}
+        monkeypatch.setattr('stashfs.cli.subprocess.run', lambda *a, **k: ran.update(n=ran['n'] + 1))
+        rc = main(['unmount'])
+        assert rc == 0
+        assert ran['n'] == 0
+
+    def test_unmount_reports_failure(self, monkeypatch):
+        from pathlib import Path
+
+        monkeypatch.setattr('stashfs.cli.iter_stashfs_mounts', lambda *_a, **_k: [Path('/mnt/one')])
+
+        def fake_run(cmd, **_kwargs):
+            return types.SimpleNamespace(returncode=1, stderr='busy')
+
+        monkeypatch.setattr('stashfs.cli.subprocess.run', fake_run)
+        rc = main(['unmount'])
+        assert rc == 1
+
+
 class TestImplicitMount:
     """`stash <existing-file>` should behave like `stash mount <existing-file>`.
 

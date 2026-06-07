@@ -20,11 +20,12 @@ import argparse
 import getpass
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 from stashfs.crypto import KDF
-from stashfs.fuse_app import _configure_logging, run_mount
+from stashfs.fuse_app import _configure_logging, iter_stashfs_mounts, run_mount
 
 
 log = logging.getLogger('stashfs.cli')
@@ -55,10 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     opt_p.add_argument('--debug', action='store_true')
 
+    sub.add_parser('unmount', aliases=['u'], help='Unmount every mounted stashfs filesystem')
+
     return parser
 
 
-_SUBCOMMANDS = frozenset({'mount', 'optimize'})
+_SUBCOMMANDS = frozenset({'mount', 'optimize', 'unmount', 'u'})
 
 
 def _inject_implicit_mount(argv: list[str] | None) -> list[str] | None:
@@ -90,6 +93,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_mount(args)
     if args.command == 'optimize':
         return _run_optimize(args)
+    if args.command in ('unmount', 'u'):
+        return _run_unmount(args)
     parser.error(f'unknown command {args.command!r}')
     return 2
 
@@ -145,6 +150,34 @@ def _run_optimize(args: argparse.Namespace) -> int:
         f'dropped={report.dropped_slots}'
     )
     return 0
+
+
+def _run_unmount(_args: argparse.Namespace) -> int:
+    mounts = iter_stashfs_mounts()
+    if not mounts:
+        print('no stashfs filesystems are currently mounted')
+        return 0
+
+    failures = 0
+    for mountpoint in mounts:
+        try:
+            result = subprocess.run(
+                ['fusermount', '-u', str(mountpoint)],
+                check=False,
+                timeout=5,
+                capture_output=True,
+                text=True,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            print(f'error: failed to unmount {mountpoint}: {exc}', file=sys.stderr)
+            failures += 1
+            continue
+        if result.returncode == 0:
+            print(f'unmounted {mountpoint}')
+        else:
+            print(f'error: failed to unmount {mountpoint}: {result.stderr.strip()}', file=sys.stderr)
+            failures += 1
+    return 1 if failures else 0
 
 
 if __name__ == '__main__':
