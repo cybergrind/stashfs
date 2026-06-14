@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 from stashfs.crypto import KDF
-from stashfs.fuse_app import _configure_logging, iter_stashfs_mounts, run_mount
+from stashfs.fuse_app import DEFAULT_FORCE_TTL, _configure_logging, iter_stashfs_mounts, run_mount
 
 
 log = logging.getLogger('stashfs.cli')
@@ -39,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     mount_p.add_argument('fname', type=lambda x: Path(x).resolve())
     mount_p.add_argument('mountpoint', nargs='?', default='/tmp/aaa', type=Path)
     mount_p.add_argument('--ttl', type=int, default=300)
+    mount_p.add_argument('--force-ttl', type=int, default=DEFAULT_FORCE_TTL)
     mount_p.add_argument('--debug', action='store_true')
 
     opt_p = sub.add_parser('optimize', help='Rebuild the backing file to reclaim space')

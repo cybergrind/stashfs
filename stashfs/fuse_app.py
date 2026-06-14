@@ -36,6 +36,9 @@ log = logging.getLogger('stashfs')
 fuse.fuse_python_api = (0, 2)
 TIME_PAT = re.compile(r'.*\/\d+\.\d+')
 
+# Force-unmount after 5 hours regardless of activity. ``-1`` disables it.
+DEFAULT_FORCE_TTL = 5 * 60 * 60
+
 if not hasattr(fuse, '__version__'):
     raise RuntimeError("your fuse-py doesn't know of fuse.__version__, probably it's too old.")
 
@@ -62,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('fname', type=lambda x: Path(x).resolve())
     parser.add_argument('mountpoint', nargs='?', default='/tmp/aaa', type=Path)
     parser.add_argument('--ttl', type=int, default=300)
+    parser.add_argument('--force-ttl', type=int, default=DEFAULT_FORCE_TTL)
     parser.add_argument('--debug', action='store_true')
     return parser.parse_args()
 
@@ -98,6 +102,10 @@ class Stash(fuse.Fuse):
         kdf: KDF | None = None,
     ) -> None:
         self._ctime = time.time()
+        # ``_mount_time`` is fixed at mount and never refreshed; it backs the
+        # force-unmount timer, which fires regardless of activity. ``_ctime``
+        # tracks the last VFS call and backs the inactivity timer.
+        self._mount_time = time.time()
         self._args = args
         self.dst = args.fname
         self.mountpoint = args.mountpoint
@@ -112,8 +120,22 @@ class Stash(fuse.Fuse):
         self.volume = Volume(self.container, self.kdf, password)
         log.info(f'Stash mounted slot {self.volume.slot_index} with {len(self.volume.list())} files')
 
+    def _should_unmount(self) -> bool:
+        """True when either the inactivity or the force timer has expired.
+
+        The inactivity timer (``ttl``) is reset on every VFS call via
+        ``_ctime``. The force timer (``force_ttl``) is measured from the
+        fixed mount time so it fires even under continuous activity;
+        ``-1`` disables it.
+        """
+        now = time.time()
+        if now - self._ctime > self._args.ttl:
+            return True
+        force_ttl = getattr(self._args, 'force_ttl', DEFAULT_FORCE_TTL)
+        return force_ttl != -1 and now - self._mount_time > force_ttl
+
     def getattr(self, path: str):
-        if time.time() - self._ctime > self._args.ttl:
+        if self._should_unmount():
             # Flush any deferred index commit before letting the
             # filesystem unmount, otherwise writes that arrived
             # without a closing ``flush(2)`` (e.g. a process killed

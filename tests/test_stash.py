@@ -285,6 +285,58 @@ class TestDirectories:
         assert stash.read('/dst/file', 5, 0) == b'hello'
 
 
+class TestForceUnmount:
+    """Force-unmount fires after ``force_ttl`` regardless of activity."""
+
+    def _stash(self, tmp_path, fast_kdf, **kw):
+        path = tmp_path / 'backing'
+        path.write_bytes(b'')
+        s = Stash()
+        s.add_args(FakeArgs(fname=path, **kw), password='', kdf=fast_kdf)
+        return s
+
+    def test_force_unmount_fires_despite_recent_activity(self, tmp_path, fast_kdf, monkeypatch):
+        import time as _time
+
+        exits = []
+        monkeypatch.setattr('stashfs.fuse_app.call_fuse_exit', lambda mp: exits.append(mp))
+
+        s = self._stash(tmp_path, fast_kdf, ttl=300, force_ttl=10)
+        # Mounted 11s ago, but last activity is right now: inactivity TTL is
+        # not exceeded, yet the force timer must still trigger.
+        s._mount_time = _time.time() - 11
+        s._ctime = _time.time()
+
+        assert s.getattr('/') == -errno.ENOENT
+        assert exits == [s.mountpoint]
+
+    def test_force_unmount_disabled_with_negative_one(self, tmp_path, fast_kdf, monkeypatch):
+        import time as _time
+
+        exits = []
+        monkeypatch.setattr('stashfs.fuse_app.call_fuse_exit', lambda mp: exits.append(mp))
+
+        s = self._stash(tmp_path, fast_kdf, ttl=300, force_ttl=-1)
+        s._mount_time = _time.time() - 10_000_000
+        s._ctime = _time.time()
+
+        assert s.getattr('/') != -errno.ENOENT  # normal stat, no unmount
+        assert exits == []
+
+    def test_inactivity_unmount_still_works(self, tmp_path, fast_kdf, monkeypatch):
+        import time as _time
+
+        exits = []
+        monkeypatch.setattr('stashfs.fuse_app.call_fuse_exit', lambda mp: exits.append(mp))
+
+        s = self._stash(tmp_path, fast_kdf, ttl=10, force_ttl=-1)
+        s._mount_time = _time.time()
+        s._ctime = _time.time() - 11  # idle past the inactivity TTL
+
+        assert s.getattr('/') == -errno.ENOENT
+        assert exits == [s.mountpoint]
+
+
 class TestRename:
     """FUSE-level rename contract (``mv src dst``)."""
 

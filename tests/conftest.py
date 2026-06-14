@@ -22,6 +22,7 @@ class FakeArgs:
     fname: Path
     mountpoint: str = ''
     ttl: int = 300
+    force_ttl: int = 5 * 60 * 60
     debug: bool = False
 
 
