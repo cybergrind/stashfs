@@ -18,6 +18,7 @@ import os
 import re
 import stat
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -118,6 +119,12 @@ class Stash(fuse.Fuse):
         self.container = Container(self.cover)
         self.kdf = kdf or KDF()
         self.volume = Volume(self.container, self.kdf, password)
+        # TTL watcher state. The thread is started explicitly via
+        # ``start_ttl_watcher`` (from ``mount``) rather than here, so tests
+        # that build a ``Stash`` directly don't spawn background threads.
+        self._watch_interval = 5.0
+        self._stop_watch = threading.Event()
+        self._watcher: threading.Thread | None = None
         log.info(f'Stash mounted slot {self.volume.slot_index} with {len(self.volume.list())} files')
 
     def _should_unmount(self) -> bool:
@@ -134,19 +141,58 @@ class Stash(fuse.Fuse):
         force_ttl = getattr(self._args, 'force_ttl', DEFAULT_FORCE_TTL)
         return force_ttl != -1 and now - self._mount_time > force_ttl
 
-    def getattr(self, path: str):
-        if self._should_unmount():
-            # Flush any deferred index commit before letting the
-            # filesystem unmount, otherwise writes that arrived
-            # without a closing ``flush(2)`` (e.g. a process killed
-            # mid-copy) would be silently dropped on the way out.
-            try:
-                self.volume.flush()
-            except Exception:
-                log.exception('flush before auto-unmount')
-            call_fuse_exit(self.mountpoint)
-            return -errno.ENOENT
+    def _maybe_auto_unmount(self) -> bool:
+        """Flush and kick off an unmount when a TTL has expired.
 
+        Returns ``True`` once an unmount has been triggered. Driven by the
+        watcher thread (see ``start_ttl_watcher``); kept as its own method
+        so the decision can be unit-tested without spinning the thread.
+        """
+        if not self._should_unmount():
+            return False
+        # Flush any deferred index commit before letting the filesystem
+        # unmount, otherwise writes that arrived without a closing
+        # ``flush(2)`` (e.g. a process killed mid-copy) would be silently
+        # dropped on the way out.
+        try:
+            self.volume.flush()
+        except Exception:
+            log.exception('flush before auto-unmount')
+        call_fuse_exit(self.mountpoint)
+        return True
+
+    def _watch_ttl(self) -> None:
+        # ``Event.wait`` returns True only once stop is signalled, so the
+        # loop ticks every ``_watch_interval`` seconds until it is told to
+        # stop or it fires an unmount — whichever comes first.
+        while not self._stop_watch.wait(self._watch_interval):
+            if self._maybe_auto_unmount():
+                return
+
+    def start_ttl_watcher(self) -> None:
+        """Spawn the background daemon that unmounts an idle mount.
+
+        Checking the TTL from a dedicated thread (rather than from
+        ``getattr``) means a genuinely idle mount — one the OS never stats
+        — still unmounts on schedule instead of lingering until some VFS
+        call happens to wander past the expiry check.
+        """
+        if self._watcher is not None:
+            return
+        self._stop_watch.clear()
+        self._watcher = threading.Thread(target=self._watch_ttl, name='stashfs-ttl', daemon=True)
+        self._watcher.start()
+
+    def stop_ttl_watcher(self) -> None:
+        """Signal the watcher to exit and wait for it to wind down."""
+        self._stop_watch.set()
+        watcher = self._watcher
+        if watcher is not None:
+            watcher.join(timeout=5)
+            self._watcher = None
+
+    def getattr(self, path: str):
+        self._ctime = time.time()
         st = MyStat()
         st.st_ctime = st.st_mtime = st.st_atime = int(time.time())
 
@@ -379,10 +425,27 @@ class Stash(fuse.Fuse):
         return 0
 
 
-def auto_unmount(mountpoint: Path) -> None:
-    """Wait a beat, then unmount."""
-    time.sleep(0.01)
-    os.system(f'fusermount -u {mountpoint}')
+def auto_unmount(
+    mountpoint: Path,
+    runner: Callable[..., Any] = subprocess.run,
+) -> None:
+    """Detach ``mountpoint`` lazily, logging (never raising on) failure.
+
+    ``-z`` (lazy) detaches the path from the namespace immediately and
+    lets the kernel finish cleanup once the last reference drops. A plain
+    ``fusermount -u`` instead returns ``EBUSY`` whenever anything holds the
+    mount — a shell ``cd``'d into it, an open handle, even an in-flight VFS
+    call — which is exactly how the idle-unmount used to silently leave the
+    directory mounted. We also check the return code and surface failures
+    instead of dropping them on the floor the way ``os.system`` did.
+    """
+    try:
+        res = runner(['fusermount', '-u', '-z', str(mountpoint)], check=False, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        log.warning('auto-unmount of %s failed: %s', mountpoint, exc)
+        return
+    if getattr(res, 'returncode', 0) != 0:
+        log.warning('auto-unmount of %s failed (rc=%s)', mountpoint, res.returncode)
 
 
 def mount(args, password: str = '') -> None:
@@ -393,6 +456,7 @@ def mount(args, password: str = '') -> None:
     )
     f.add_args(args, password=password)
     f.parser.add_option(mountopt=args.mountpoint, metavar='PATH', default=args.mountpoint)
+    f.start_ttl_watcher()
     f.main(['stashfs.py', str(args.mountpoint)])
 
 

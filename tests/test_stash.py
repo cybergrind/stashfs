@@ -7,11 +7,15 @@ continue to live in the package for historical callers.
 from __future__ import annotations
 
 import errno
+import logging
+import time
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from stashfs import KDF, FileRecord, FileStructure, FileWrapper, KDFParams, Stash
-from stashfs.fuse_app import _ensure_mountpoint, _looks_like_fuse_mount, _unmount_stale
+from stashfs.fuse_app import _ensure_mountpoint, _looks_like_fuse_mount, _unmount_stale, auto_unmount
 from stashfs.volume import Volume
 from tests.conftest import FakeArgs
 
@@ -285,8 +289,44 @@ class TestDirectories:
         assert stash.read('/dst/file', 5, 0) == b'hello'
 
 
-class TestForceUnmount:
-    """Force-unmount fires after ``force_ttl`` regardless of activity."""
+class TestAutoUnmount:
+    """``auto_unmount`` detaches lazily and never raises on failure."""
+
+    def test_uses_lazy_unmount_flag(self):
+        calls = []
+
+        def runner(argv, **kw):
+            calls.append(argv)
+            return SimpleNamespace(returncode=0)
+
+        auto_unmount(Path('/mnt/x'), runner=runner)
+        # ``-z`` (lazy) so a momentarily busy mount still detaches instead
+        # of failing the way a plain ``fusermount -u`` would.
+        assert calls == [['fusermount', '-u', '-z', '/mnt/x']]
+
+    def test_logs_on_nonzero_exit(self, caplog):
+        def runner(argv, **kw):
+            return SimpleNamespace(returncode=1)
+
+        with caplog.at_level(logging.WARNING, logger='stashfs'):
+            auto_unmount(Path('/mnt/x'), runner=runner)
+        assert any('failed' in r.getMessage() for r in caplog.records)
+
+    def test_swallows_runner_errors(self, caplog):
+        def runner(argv, **kw):
+            raise FileNotFoundError('fusermount not installed')
+
+        with caplog.at_level(logging.WARNING, logger='stashfs'):
+            auto_unmount(Path('/mnt/x'), runner=runner)  # must not raise
+        assert any('failed' in r.getMessage() for r in caplog.records)
+
+
+class TestTTLUnmount:
+    """The TTL watcher flushes and unmounts on inactivity or force timeout.
+
+    The check is driven by a background thread (``start_ttl_watcher``) rather
+    than ``getattr``, so a genuinely idle mount still unmounts on schedule.
+    """
 
     def _stash(self, tmp_path, fast_kdf, **kw):
         path = tmp_path / 'backing'
@@ -296,45 +336,80 @@ class TestForceUnmount:
         return s
 
     def test_force_unmount_fires_despite_recent_activity(self, tmp_path, fast_kdf, monkeypatch):
-        import time as _time
-
         exits = []
         monkeypatch.setattr('stashfs.fuse_app.call_fuse_exit', lambda mp: exits.append(mp))
 
         s = self._stash(tmp_path, fast_kdf, ttl=300, force_ttl=10)
         # Mounted 11s ago, but last activity is right now: inactivity TTL is
         # not exceeded, yet the force timer must still trigger.
-        s._mount_time = _time.time() - 11
-        s._ctime = _time.time()
+        s._mount_time = time.time() - 11
+        s._ctime = time.time()
 
-        assert s.getattr('/') == -errno.ENOENT
+        assert s._maybe_auto_unmount() is True
         assert exits == [s.mountpoint]
 
     def test_force_unmount_disabled_with_negative_one(self, tmp_path, fast_kdf, monkeypatch):
-        import time as _time
-
         exits = []
         monkeypatch.setattr('stashfs.fuse_app.call_fuse_exit', lambda mp: exits.append(mp))
 
         s = self._stash(tmp_path, fast_kdf, ttl=300, force_ttl=-1)
-        s._mount_time = _time.time() - 10_000_000
-        s._ctime = _time.time()
+        s._mount_time = time.time() - 10_000_000
+        s._ctime = time.time()
 
-        assert s.getattr('/') != -errno.ENOENT  # normal stat, no unmount
+        assert s._maybe_auto_unmount() is False
         assert exits == []
 
     def test_inactivity_unmount_still_works(self, tmp_path, fast_kdf, monkeypatch):
-        import time as _time
-
         exits = []
         monkeypatch.setattr('stashfs.fuse_app.call_fuse_exit', lambda mp: exits.append(mp))
 
         s = self._stash(tmp_path, fast_kdf, ttl=10, force_ttl=-1)
-        s._mount_time = _time.time()
-        s._ctime = _time.time() - 11  # idle past the inactivity TTL
+        s._mount_time = time.time()
+        s._ctime = time.time() - 11  # idle past the inactivity TTL
 
-        assert s.getattr('/') == -errno.ENOENT
+        assert s._maybe_auto_unmount() is True
         assert exits == [s.mountpoint]
+
+    def test_getattr_no_longer_triggers_unmount(self, tmp_path, fast_kdf, monkeypatch):
+        # Even idle past every TTL, ``getattr`` serves a normal stat now —
+        # unmounting is the watcher thread's job, not the VFS path's.
+        exits = []
+        monkeypatch.setattr('stashfs.fuse_app.call_fuse_exit', lambda mp: exits.append(mp))
+
+        s = self._stash(tmp_path, fast_kdf, ttl=10, force_ttl=-1)
+        s._ctime = time.time() - 100
+
+        assert s.getattr('/') != -errno.ENOENT
+        assert exits == []
+
+    def test_watcher_unmounts_idle_mount(self, tmp_path, fast_kdf, monkeypatch):
+        # The background thread fires with zero VFS traffic.
+        exits = []
+        monkeypatch.setattr('stashfs.fuse_app.call_fuse_exit', lambda mp: exits.append(mp))
+
+        s = self._stash(tmp_path, fast_kdf, ttl=10, force_ttl=-1)
+        s._ctime = time.time() - 11
+        s._watch_interval = 0.01
+        s.start_ttl_watcher()
+        deadline = time.time() + 2
+        while not exits and time.time() < deadline:
+            time.sleep(0.01)
+        s.stop_ttl_watcher()
+
+        assert exits == [s.mountpoint]
+
+    def test_watcher_leaves_active_mount_alone(self, tmp_path, fast_kdf, monkeypatch):
+        exits = []
+        monkeypatch.setattr('stashfs.fuse_app.call_fuse_exit', lambda mp: exits.append(mp))
+
+        s = self._stash(tmp_path, fast_kdf, ttl=10, force_ttl=-1)
+        s._ctime = time.time()  # fresh activity, well within the TTL
+        s._watch_interval = 0.01
+        s.start_ttl_watcher()
+        time.sleep(0.05)  # several ticks
+        s.stop_ttl_watcher()
+
+        assert exits == []
 
 
 class TestRename:
