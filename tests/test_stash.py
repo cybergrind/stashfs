@@ -411,6 +411,33 @@ class TestTTLUnmount:
 
         assert exits == []
 
+    def test_fsinit_starts_watcher_in_daemon(self, tmp_path, fast_kdf):
+        # libfuse daemonizes with fork() inside ``Fuse.main``; threads do
+        # not survive a fork, so a watcher started before ``main`` dies
+        # with the parent and no TTL ever fires. ``fsinit`` is the hook
+        # libfuse invokes in the daemon process, so the watcher must be
+        # spawned there.
+        s = self._stash(tmp_path, fast_kdf, ttl=10, force_ttl=-1)
+        assert s._watcher is None
+        s.fsinit()
+        try:
+            assert s._watcher is not None
+            assert s._watcher.is_alive()
+        finally:
+            s.stop_ttl_watcher()
+
+    def test_fsinit_restamps_timers(self, tmp_path, fast_kdf):
+        # TTLs should measure from when the daemon actually starts
+        # serving, not from when the parent process built the object.
+        s = self._stash(tmp_path, fast_kdf, ttl=10, force_ttl=100)
+        s._mount_time = s._ctime = 0.0
+        s.fsinit()
+        try:
+            assert time.time() - s._mount_time < 5
+            assert time.time() - s._ctime < 5
+        finally:
+            s.stop_ttl_watcher()
+
 
 class TestRename:
     """FUSE-level rename contract (``mv src dst``)."""

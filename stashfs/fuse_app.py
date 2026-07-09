@@ -183,6 +183,20 @@ class Stash(fuse.Fuse):
         self._watcher = threading.Thread(target=self._watch_ttl, name='stashfs-ttl', daemon=True)
         self._watcher.start()
 
+    def fsinit(self) -> None:
+        """Start the TTL watcher inside the daemon process.
+
+        libfuse daemonizes with ``fork()`` before serving requests, and
+        threads do not survive a fork — a watcher started before
+        ``Fuse.main`` dies with the parent, leaving the mount immortal
+        (no ``--ttl``, no ``--force-ttl``). ``fsinit`` runs in the
+        daemon after the fork, so this is the one safe place to spawn
+        the thread. The timers are re-stamped so both TTLs measure from
+        when the filesystem actually starts serving.
+        """
+        self._mount_time = self._ctime = time.time()
+        self.start_ttl_watcher()
+
     def stop_ttl_watcher(self) -> None:
         """Signal the watcher to exit and wait for it to wind down."""
         self._stop_watch.set()
@@ -456,7 +470,9 @@ def mount(args, password: str = '') -> None:
     )
     f.add_args(args, password=password)
     f.parser.add_option(mountopt=args.mountpoint, metavar='PATH', default=args.mountpoint)
-    f.start_ttl_watcher()
+    # The TTL watcher is NOT started here: ``f.main`` daemonizes via
+    # ``fork()`` and threads don't survive it. ``Stash.fsinit`` (called
+    # by libfuse inside the daemon) starts the watcher instead.
     f.main(['stashfs.py', str(args.mountpoint)])
 
 
