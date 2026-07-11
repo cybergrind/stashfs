@@ -18,6 +18,16 @@ class TestCLIParser:
         assert 'mount' in captured.out
         assert 'optimize' in captured.out
 
+    def test_mount_resolves_relative_mountpoint(self, monkeypatch, tmp_path):
+        # libfuse daemonizes with chdir('/'), so a mountpoint kept
+        # relative makes the TTL unmount run ``fusermount -u -z rel``
+        # from ``/`` and fail forever. Resolve while cwd is still the
+        # user's shell cwd.
+        monkeypatch.chdir(tmp_path)
+        args = build_parser().parse_args(['mount', 'backing', 'rel-mnt'])
+        assert args.mountpoint.is_absolute()
+        assert args.mountpoint == (tmp_path / 'rel-mnt').resolve()
+
     def test_optimize_invocation(self, multi_stash, fast_kdf, monkeypatch):
         alpha = multi_stash.mount('alpha')
         assert alpha.write('/f', b'hello', 0) == 5

@@ -64,7 +64,10 @@ def _configure_logging(debug: bool) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='DESCRIPTION')
     parser.add_argument('fname', type=lambda x: Path(x).resolve())
-    parser.add_argument('mountpoint', nargs='?', default='/tmp/aaa', type=Path)
+    # Resolved eagerly: libfuse daemonizes with chdir('/'), so a relative
+    # mountpoint kept as-is would make the TTL fusermount target a path
+    # that no longer exists from the daemon's cwd.
+    parser.add_argument('mountpoint', nargs='?', default='/tmp/aaa', type=lambda x: Path(x).resolve())
     parser.add_argument('--ttl', type=int, default=300)
     parser.add_argument('--force-ttl', type=int, default=DEFAULT_FORCE_TTL)
     parser.add_argument('--debug', action='store_true')
@@ -109,7 +112,10 @@ class Stash(fuse.Fuse):
         self._mount_time = time.time()
         self._args = args
         self.dst = args.fname
-        self.mountpoint = args.mountpoint
+        # Pinned to an absolute path while cwd is still the caller's: by
+        # the time the watcher hands this to fusermount the daemon has
+        # chdir'd to '/' and a relative path would never unmount.
+        self.mountpoint = Path(args.mountpoint).resolve()
         self.password = password
         self.storage = FileWrapper(self.dst)
         # CoverStorage wraps the raw file so any existing bytes are
@@ -164,10 +170,16 @@ class Stash(fuse.Fuse):
     def _watch_ttl(self) -> None:
         # ``Event.wait`` returns True only once stop is signalled, so the
         # loop ticks every ``_watch_interval`` seconds until it is told to
-        # stop or it fires an unmount — whichever comes first.
+        # stop. An unmount that has fired is verified against /proc/mounts
+        # and retried while the mount is still visible — fusermount can
+        # fail (EBUSY, races) and a single failed attempt must not leave
+        # the mount immortal. Once the detach takes, the thread winds
+        # down; the daemon exits when the kernel drops the connection.
+        fired = False
         while not self._stop_watch.wait(self._watch_interval):
-            if self._maybe_auto_unmount():
+            if fired and not _looks_like_fuse_mount(self.mountpoint):
                 return
+            fired = self._maybe_auto_unmount() or fired
 
     def start_ttl_watcher(self) -> None:
         """Spawn the background daemon that unmounts an idle mount.

@@ -37,7 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     mount_p = sub.add_parser('mount', help='Mount the filesystem')
     mount_p.add_argument('fname', type=lambda x: Path(x).resolve())
-    mount_p.add_argument('mountpoint', nargs='?', default='/tmp/aaa', type=Path)
+    # Resolved eagerly — the FUSE daemon chdir()s to '/', so a relative
+    # mountpoint would break the TTL auto-unmount (see fuse_app.parse_args).
+    mount_p.add_argument('mountpoint', nargs='?', default='/tmp/aaa', type=lambda x: Path(x).resolve())
     mount_p.add_argument('--ttl', type=int, default=300)
     mount_p.add_argument('--force-ttl', type=int, default=DEFAULT_FORCE_TTL)
     mount_p.add_argument('--debug', action='store_true')

@@ -411,6 +411,54 @@ class TestTTLUnmount:
 
         assert exits == []
 
+    def test_add_args_resolves_relative_mountpoint(self, tmp_path, fast_kdf, monkeypatch):
+        # ``self.mountpoint`` is what the watcher hands to fusermount —
+        # by then the daemon's cwd is ``/`` (libfuse daemonize), so it
+        # must be pinned to an absolute path while cwd is still sane.
+        monkeypatch.chdir(tmp_path)
+        s = self._stash(tmp_path, fast_kdf, mountpoint=Path('rel-mnt'))
+        assert s.mountpoint.is_absolute()
+        assert s.mountpoint == (tmp_path / 'rel-mnt').resolve()
+
+    def test_watcher_retries_while_still_mounted(self, tmp_path, fast_kdf, monkeypatch):
+        # A fusermount that fails (relative path, EBUSY, a race) must be
+        # retried: as long as the mountpoint is still in /proc/mounts the
+        # watcher keeps firing instead of giving up after one attempt.
+        exits = []
+        monkeypatch.setattr('stashfs.fuse_app.call_fuse_exit', lambda mp: exits.append(mp))
+        monkeypatch.setattr('stashfs.fuse_app._looks_like_fuse_mount', lambda mp: True)
+
+        s = self._stash(tmp_path, fast_kdf, ttl=10, force_ttl=-1)
+        s._ctime = time.time() - 11
+        s._watch_interval = 0.01
+        s.start_ttl_watcher()
+        deadline = time.time() + 2
+        while len(exits) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        s.stop_ttl_watcher()
+
+        assert len(exits) >= 2
+
+    def test_watcher_exits_once_detached(self, tmp_path, fast_kdf, monkeypatch):
+        # Once the lazy detach removes the mount from /proc/mounts the
+        # watcher winds down instead of spawning fusermount forever.
+        exits = []
+        monkeypatch.setattr('stashfs.fuse_app.call_fuse_exit', lambda mp: exits.append(mp))
+        monkeypatch.setattr('stashfs.fuse_app._looks_like_fuse_mount', lambda mp: False)
+
+        s = self._stash(tmp_path, fast_kdf, ttl=10, force_ttl=-1)
+        s._ctime = time.time() - 11
+        s._watch_interval = 0.01
+        s.start_ttl_watcher()
+        deadline = time.time() + 2
+        while s._watcher is not None and s._watcher.is_alive() and time.time() < deadline:
+            time.sleep(0.01)
+        still_alive = s._watcher is not None and s._watcher.is_alive()
+        s.stop_ttl_watcher()
+
+        assert exits == [s.mountpoint]
+        assert not still_alive
+
     def test_fsinit_starts_watcher_in_daemon(self, tmp_path, fast_kdf):
         # libfuse daemonizes with fork() inside ``Fuse.main``; threads do
         # not survive a fork, so a watcher started before ``main`` dies
